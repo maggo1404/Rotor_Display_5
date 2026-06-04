@@ -1,14 +1,14 @@
 /**
- * Transparente Brücke: USB Serial <-> HW-UART (RS485, Halbduplex).
+ * Transparente Bruecke: USB Serial <-> HW-UART (RS485, Halbduplex).
  *
- * RS485 = ein Sender zu jeder Zeit. Kollisionen entstehen, wenn der Controller
- * PC-Daten auf den Bus schickt, während der Rotor noch eine Antwort sendet —
- * oder wenn der Controller (rotor_rs485 / hw_send) zu früh nach einer Slave-
- * Antwort wieder sendet, bevor Halbduplex/MAX485 sauber umgeschaltet ist.
+ * Architektur:
+ * - USB-RX liest komplette #...$ Frames vom PC und legt sie in die RS485-TX-Queue.
+ * - Ein einziger RS485-TX-Task sendet alle PC- und Controller-Frames auf den Bus.
+ * - RS485-RX liest den Bus schnell aus und verteilt Bytes parallel an USB-TX und Sniffer.
+ * - USB-TX schreibt unabhaengig zum PC.
+ * - Sniffer ruft rotor_rs485_rx_bytes() auf, damit Display/State aktualisiert werden.
  *
- * Schutz: Zeitbasierte Bus-Idle — nach jeder Aktivität (TX oder RX) mindestens
- * kBusIdleUs Stille, bevor erneut gesendet wird. Gilt jetzt auch fuer hw_send(),
- * nicht nur fuer USB->Bus (pump_usb_to_hw).
+ * Damit blockieren Parser, LVGL/UI und USB-CDC-Backpressure nicht mehr den RS485-RX-Hotpath.
  */
 
 #include "serial_bridge.h"
@@ -16,13 +16,11 @@
 
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 #include <freertos/semphr.h>
+#include <freertos/task.h>
 
 namespace serial_bridge {
-
-static SemaphoreHandle_t s_uart_mutex;
-
-// --- Konfiguration (Board / Verdrahtung) ---------------------------------
 
 /** TX-Leitung zum RS485-Wandler */
 static constexpr int kPinUartTx = 43;
@@ -30,40 +28,64 @@ static constexpr int kPinUartTx = 43;
 static constexpr int kPinUartRx = 44;
 /** DE/RE bzw. Sende-/Empfangsumschaltung (typ. MAX485: HIGH = Senden aktiv) */
 static constexpr int kPinRs485Dir = 39;
-
 /** true: Dir-Pin HIGH = Senden; false: invertierte Ansteuerung */
 static constexpr bool kDirTransmitLevel = true;
 
-/** Puffer für USB -> HW (weniger Umschalten als Byte für Byte) */
-static constexpr size_t kUsbToHwBuf = 256;
-/** HW -> USB + Parser: Blockgröße (Schleife leert UART vollständig pro poll()) */
-static constexpr size_t kHwToUsbBuf = 512;
+/** Max. RS485-Telegramm inkl. '$' */
+static constexpr size_t kFrameMax = 320;
+/** UART-RX Lese-Chunk; Frames bleiben im Stream erhalten. */
+static constexpr size_t kIoChunkMax = 256;
 
-/** Wartezeit nach letztem gesendeten Byte, bevor wieder Empfang (Bus-Freigabe) */
+/** Queue-Tiefen: genug Puffer fuer kurze PC-Bursts, ohne RX/USB dauerhaft zu blockieren. */
+static constexpr size_t kTxQueueDepth = 64;
+static constexpr size_t kTxPriorityQueueDepth = 12;
+static constexpr size_t kUsbTxQueueDepth = 96;
+static constexpr size_t kSniffQueueDepth = 96;
+
+/** Wartezeit nach letztem gesendeten Byte, bevor wieder Empfang (Bus-Freigabe). */
 static constexpr uint32_t kTurnaroundMicros = 250;
-
-/**
- * Mindest-Stille vor erneutem Senden (Controller + USB). 12 ms ≈ 138 Byte-Zeiten
- * @ 115200 — groessere Marge fuer MAX485/Slave-Umschaltung (sonst lange GETREF-Timeouts).
- */
-static constexpr uint32_t kBusIdleUs = 12000;
-/** SETPOSCC-Priorität: deutlich kürzere Mindest-Stille vor Senden. */
+/** Mindest-Stille vor PC- oder Controller-Frames. */
+static constexpr uint32_t kBusIdleUsPc = 1400;
+static constexpr uint32_t kBusIdleUsCtrl = 12000;
 static constexpr uint32_t kBusIdleUsPriority = 1800;
-
-/** Max. Warten auf Bus-Idle (ms); muss deutlich > kBusIdleUs sein, sonst Senden ohne Pause. */
-static constexpr uint32_t kBusIdleWaitCapMs = 200;
+static constexpr uint32_t kBusIdleWaitCapPcMs = 25;
+static constexpr uint32_t kBusIdleWaitCapCtrlMs = 200;
 static constexpr uint32_t kBusIdleWaitCapPriorityMs = 35;
+static constexpr uint32_t kPcProxyAutoSilenceMs = 12000;
+
+struct TxFrame {
+    uint16_t len;
+    uint8_t flags;
+    uint8_t data[kFrameMax];
+};
+
+struct IoChunk {
+    uint16_t len;
+    uint8_t data[kIoChunkMax];
+};
+
+static constexpr uint8_t kTxFlagFromPc = 0x01u;
+static constexpr uint8_t kTxFlagPriority = 0x02u;
 
 static HardwareSerial *s_hw = &Serial2;
 static uint32_t s_baud = 115200;
+static volatile BridgeMode s_mode = BridgeMode::LocalMaster;
+static volatile uint32_t s_last_pc_frame_ms = 0;
+
+static SemaphoreHandle_t s_uart_mutex = nullptr;
+static QueueHandle_t s_tx_q = nullptr;
+static QueueHandle_t s_tx_prio_q = nullptr;
+static QueueHandle_t s_usb_tx_q = nullptr;
+static QueueHandle_t s_sniff_q = nullptr;
+
+static TaskHandle_t s_task_usb_rx = nullptr;
+static TaskHandle_t s_task_rs485_tx = nullptr;
+static TaskHandle_t s_task_rs485_rx = nullptr;
+static TaskHandle_t s_task_usb_tx = nullptr;
+static TaskHandle_t s_task_sniffer = nullptr;
 
 /** Zeitstempel der letzten Bus-Aktivität (TX oder RX), micros(). */
-static uint32_t s_last_bus_activity_us = 0;
-
-/** Ausstehende USB-Spiegel-Bytes (verlustfrei, auch wenn CDC kurz voll ist). */
-static constexpr size_t kUsbMirrorPendingCap = 12288;
-static uint8_t s_usb_mirror_pending[kUsbMirrorPendingCap];
-static size_t s_usb_mirror_pending_len = 0;
+static volatile uint32_t s_last_bus_activity_us = 0;
 
 void set_baud(uint32_t baud) { s_baud = baud; }
 
@@ -91,110 +113,102 @@ void uart_unlock()
     }
 }
 
-static void mirror_usb_pending_push(const uint8_t *data, size_t len)
+void set_mode(BridgeMode mode)
 {
-    if (!data || len == 0) {
-        return;
-    }
-    if (len >= kUsbMirrorPendingCap) {
-        data += (len - kUsbMirrorPendingCap);
-        len = kUsbMirrorPendingCap;
-        s_usb_mirror_pending_len = 0;
-    } else if (s_usb_mirror_pending_len + len > kUsbMirrorPendingCap) {
-        const size_t drop = s_usb_mirror_pending_len + len - kUsbMirrorPendingCap;
-        if (drop >= s_usb_mirror_pending_len) {
-            s_usb_mirror_pending_len = 0;
-        } else {
-            memmove(s_usb_mirror_pending, s_usb_mirror_pending + drop, s_usb_mirror_pending_len - drop);
-            s_usb_mirror_pending_len -= drop;
-        }
-    }
-    memcpy(s_usb_mirror_pending + s_usb_mirror_pending_len, data, len);
-    s_usb_mirror_pending_len += len;
+    s_mode = mode;
 }
 
-static void drain_usb_mirror_pending_to_cdc()
+BridgeMode get_mode()
 {
-    while (s_usb_mirror_pending_len > 0) {
-        const int space = Serial.availableForWrite();
-        if (space <= 0) return;
-        const size_t chunk = (size_t)space < s_usb_mirror_pending_len ? (size_t)space : s_usb_mirror_pending_len;
-        const size_t w = Serial.write(s_usb_mirror_pending, chunk);
-        if (w == 0) {
-            return;
-        }
-        if (w < s_usb_mirror_pending_len) {
-            memmove(s_usb_mirror_pending, s_usb_mirror_pending + w, s_usb_mirror_pending_len - w);
-        }
-        s_usb_mirror_pending_len -= w;
-    }
+    return s_mode;
 }
 
-/** USB-Monitor: nonblocking, Überhang in Pending-FIFO statt Drop. */
-static void mirror_usb_nonblocking(const uint8_t *data, size_t len)
+static bool enqueue_tx_frame(const uint8_t *data, size_t len, uint8_t flags)
 {
     if (!data || len == 0) {
+        return false;
+    }
+    QueueHandle_t q = (flags & kTxFlagPriority) ? s_tx_prio_q : s_tx_q;
+    if (!q) {
+        return false;
+    }
+    TxFrame f{};
+    if (len > sizeof(f.data)) {
+        data += (len - sizeof(f.data));
+        len = sizeof(f.data);
+    }
+    f.len = (uint16_t)len;
+    f.flags = flags;
+    memcpy(f.data, data, len);
+    return xQueueSend(q, &f, pdMS_TO_TICKS(5)) == pdPASS;
+}
+
+static void enqueue_chunk_lossy(QueueHandle_t q, const uint8_t *data, size_t len)
+{
+    if (!q || !data || len == 0) {
         return;
     }
-    drain_usb_mirror_pending_to_cdc();
     size_t off = 0;
     while (off < len) {
-        const int space = Serial.availableForWrite();
-        if (space <= 0) {
-            mirror_usb_pending_push(data + off, len - off);
-            return;
+        IoChunk c{};
+        const size_t n = (len - off) < sizeof(c.data) ? (len - off) : sizeof(c.data);
+        c.len = (uint16_t)n;
+        memcpy(c.data, data + off, n);
+        if (xQueueSend(q, &c, 0) != pdPASS) {
+            /* Transparenz darf den RS485-RX nicht blockieren. Wenn der Host/Parser nicht
+             * nachkommt, aeltesten Chunk verwerfen und den neuesten behalten. */
+            IoChunk drop{};
+            (void)xQueueReceive(q, &drop, 0);
+            (void)xQueueSend(q, &c, 0);
         }
-        const size_t chunk =
-            (size_t)space < (len - off) ? (size_t)space : (len - off);
-        const size_t w = Serial.write(data + off, chunk);
-        if (w == 0) {
-            mirror_usb_pending_push(data + off, len - off);
-            return;
-        }
-        off += w;
+        off += n;
     }
 }
 
-/** Rest-RX leeren (zwischen poll() und hw_send eingetroffen) — Parser wie in pump_hw. */
-static void drain_hw_rx_quick()
+static bool is_controller_poll_frame(const uint8_t *data, size_t len)
 {
-    for (;;) {
-        uint8_t buf[128];
-        size_t n = 0;
-        uart_lock();
-        while (s_hw->available() && n < sizeof(buf)) {
-            int c = s_hw->read();
-            if (c < 0) {
+    if (!data || len < 8 || data[0] != '#') {
+        return false;
+    }
+    int colon_count = 0;
+    size_t cmd_start = 0;
+    for (size_t i = 1; i < len; ++i) {
+        if (data[i] == ':') {
+            colon_count++;
+            if (colon_count == 2) {
+                cmd_start = i + 1;
                 break;
             }
-            buf[n++] = static_cast<uint8_t>(c);
+        } else if (data[i] == '$') {
+            return false;
         }
-        uart_unlock();
-        if (n == 0) {
-            return;
-        }
-        s_last_bus_activity_us = micros();
-        rotor_rs485_rx_bytes(buf, n);
-        mirror_usb_nonblocking(buf, n);
     }
+    if (cmd_start == 0 || cmd_start >= len) {
+        return false;
+    }
+    const size_t remaining = len - cmd_start;
+    if (remaining >= 3 && memcmp(data + cmd_start, "GET", 3) == 0) {
+        return true;
+    }
+    return remaining >= 4 && memcmp(data + cmd_start, "TEST", 4) == 0;
 }
 
-/**
- * Vor Controller-Telegramm (GETREF, GETPOS, …): gleiche Idle-Regel wie bei USB->Bus,
- * damit nicht im selben loop()-Takt direkt nach Slave-TX wieder gesendet wird.
- */
-static void wait_bus_idle_for_controller_tx(uint32_t min_idle_us, uint32_t cap_ms)
+static void wait_bus_idle(uint32_t min_idle_us, uint32_t cap_ms)
 {
     const uint32_t deadline_ms = millis() + cap_ms;
     for (;;) {
-        drain_hw_rx_quick();
-
         uart_lock();
         const bool has_rx = (s_hw->available() > 0);
         uart_unlock();
         if (has_rx) {
-            delayMicroseconds(200);
-            yield();
+            delayMicroseconds(120);
+            taskYIELD();
+            /* Fremd-Master pollt ohne Pause: UART nie leer → ohne Deadline-Abbruch wuerde
+             * SETPOSCC (hw_send_priority) nie den TX erreichen. */
+            if ((int32_t)(millis() - deadline_ms) >= 0) {
+                delayMicroseconds(min_idle_us);
+                return;
+            }
             continue;
         }
 
@@ -203,153 +217,253 @@ static void wait_bus_idle_for_controller_tx(uint32_t min_idle_us, uint32_t cap_m
         }
 
         if ((int32_t)(millis() - deadline_ms) >= 0) {
-            /* Kein volles Idle erreicht (z. B. Dauer-RX): trotzdem Mindestluecke erzwingen */
             delayMicroseconds(min_idle_us);
             return;
         }
 
-        delayMicroseconds(200);
-        yield();
+        delayMicroseconds(120);
+        taskYIELD();
+    }
+}
+
+static void send_rs485_frame(const TxFrame &f)
+{
+    const bool from_pc = (f.flags & kTxFlagFromPc) != 0;
+    const bool priority = (f.flags & kTxFlagPriority) != 0;
+
+    if (priority) {
+        wait_bus_idle(kBusIdleUsPriority, kBusIdleWaitCapPriorityMs);
+    } else if (from_pc) {
+        wait_bus_idle(kBusIdleUsPc, kBusIdleWaitCapPcMs);
+    } else {
+        wait_bus_idle(kBusIdleUsCtrl, kBusIdleWaitCapCtrlMs);
+    }
+
+    uart_lock();
+    dir_transmit();
+    s_hw->write(f.data, f.len);
+    s_hw->flush();
+    if (kTurnaroundMicros != 0) {
+        delayMicroseconds(kTurnaroundMicros);
+    }
+    dir_receive();
+    uart_unlock();
+    s_last_bus_activity_us = micros();
+
+    if (from_pc) {
+        /* PC-Frames lokal mitsniffen: SETPOSDG/SETREF/SETASELECT und Config-Kommandos
+         * aktualisieren State/UI, ohne den transparenten TX-Pfad zu blockieren. */
+        enqueue_chunk_lossy(s_sniff_q, f.data, f.len);
+    } else {
+        /* Eigene Controller-Frames zum PC spiegeln, damit der PC denselben Busstrom sieht. */
+        enqueue_chunk_lossy(s_usb_tx_q, f.data, f.len);
+    }
+}
+
+static void task_rs485_tx(void *)
+{
+    for (;;) {
+        TxFrame f{};
+        if (s_tx_prio_q && xQueueReceive(s_tx_prio_q, &f, 0) == pdPASS) {
+            send_rs485_frame(f);
+            continue;
+        }
+        if (s_tx_q && xQueueReceive(s_tx_q, &f, pdMS_TO_TICKS(2)) == pdPASS) {
+            send_rs485_frame(f);
+            continue;
+        }
+        taskYIELD();
+    }
+}
+
+static void task_rs485_rx(void *)
+{
+    for (;;) {
+        uint8_t buf[kIoChunkMax];
+        size_t n = 0;
+        uart_lock();
+        while (s_hw->available() && n < sizeof(buf)) {
+            const int c = s_hw->read();
+            if (c < 0) {
+                break;
+            }
+            buf[n++] = (uint8_t)c;
+        }
+        uart_unlock();
+
+        if (n == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+
+        s_last_bus_activity_us = micros();
+        enqueue_chunk_lossy(s_usb_tx_q, buf, n);
+        enqueue_chunk_lossy(s_sniff_q, buf, n);
+    }
+}
+
+static void task_usb_tx(void *)
+{
+    IoChunk c{};
+    for (;;) {
+        if (!s_usb_tx_q || xQueueReceive(s_usb_tx_q, &c, pdMS_TO_TICKS(5)) != pdPASS) {
+            continue;
+        }
+        size_t off = 0;
+        while (off < c.len) {
+            const int space = Serial.availableForWrite();
+            if (space <= 0) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+                continue;
+            }
+            size_t n = (size_t)space;
+            if (n > (size_t)c.len - off) {
+                n = (size_t)c.len - off;
+            }
+            const size_t w = Serial.write(c.data + off, n);
+            if (w == 0) {
+                vTaskDelay(pdMS_TO_TICKS(1));
+                continue;
+            }
+            off += w;
+        }
+    }
+}
+
+static void task_sniffer(void *)
+{
+    IoChunk c{};
+    for (;;) {
+        if (!s_sniff_q || xQueueReceive(s_sniff_q, &c, pdMS_TO_TICKS(10)) != pdPASS) {
+            continue;
+        }
+        rotor_rs485_rx_bytes(c.data, c.len);
+    }
+}
+
+static void flush_usb_rx_frame(uint8_t *buf, size_t *len)
+{
+    if (!buf || !len || *len == 0) {
+        return;
+    }
+    s_last_pc_frame_ms = millis();
+    s_mode = BridgeMode::PcProxyMaster;
+    (void)enqueue_tx_frame(buf, *len, kTxFlagFromPc);
+    *len = 0;
+}
+
+static void task_usb_rx(void *)
+{
+    uint8_t frame[kFrameMax];
+    size_t frame_len = 0;
+    bool in_frame = false;
+
+    for (;;) {
+        bool read_any = false;
+        while (Serial.available()) {
+            const int c = Serial.read();
+            if (c < 0) {
+                break;
+            }
+            read_any = true;
+            s_last_pc_frame_ms = millis();
+            s_mode = BridgeMode::PcProxyMaster;
+
+            const uint8_t b = (uint8_t)c;
+            if (!in_frame) {
+                if (b == '#') {
+                    in_frame = true;
+                    frame_len = 0;
+                    frame[frame_len++] = b;
+                }
+                continue;
+            }
+
+            if (frame_len < sizeof(frame)) {
+                frame[frame_len++] = b;
+            } else {
+                in_frame = false;
+                frame_len = 0;
+                continue;
+            }
+
+            if (b == '$' && frame_len >= 5) {
+                flush_usb_rx_frame(frame, &frame_len);
+                in_frame = false;
+            } else if (b == '#') {
+                frame_len = 1;
+                frame[0] = '#';
+            }
+        }
+        vTaskDelay(read_any ? 0 : pdMS_TO_TICKS(1));
     }
 }
 
 void hw_send(const uint8_t *data, size_t len)
 {
-    if (!data || len == 0) {
+    /* Mitläufer (USB-Proxy oder Fremd-Master am RS485): keine eigenen GET/TEST — SETPOSCC bleibt hw_send_priority. */
+    if (rotor_rs485_is_foreign_pc_listen_mode() && is_controller_poll_frame(data, len)) {
         return;
     }
-    wait_bus_idle_for_controller_tx(kBusIdleUs, kBusIdleWaitCapMs);
-
-    uart_lock();
-    dir_transmit();
-    s_hw->write(data, len);
-    s_hw->flush();
-    if (kTurnaroundMicros) {
-        delayMicroseconds(kTurnaroundMicros);
-    }
-    dir_receive();
-    uart_unlock();
-    s_last_bus_activity_us = micros();
-    mirror_usb_nonblocking(data, len);
+    (void)enqueue_tx_frame(data, len, 0u);
 }
 
 void hw_send_priority(const uint8_t *data, size_t len)
 {
-    if (!data || len == 0) {
-        return;
-    }
-    wait_bus_idle_for_controller_tx(kBusIdleUsPriority, kBusIdleWaitCapPriorityMs);
-
-    uart_lock();
-    dir_transmit();
-    s_hw->write(data, len);
-    s_hw->flush();
-    if (kTurnaroundMicros) {
-        delayMicroseconds(kTurnaroundMicros);
-    }
-    dir_receive();
-    uart_unlock();
-    s_last_bus_activity_us = micros();
-    mirror_usb_nonblocking(data, len);
+    (void)enqueue_tx_frame(data, len, kTxFlagPriority);
 }
 
 void begin()
 {
+    rotor_rs485_pre_begin();
+
     if (!s_uart_mutex) {
         s_uart_mutex = xSemaphoreCreateMutex();
     }
+    if (!s_tx_q) {
+        s_tx_q = xQueueCreate(kTxQueueDepth, sizeof(TxFrame));
+    }
+    if (!s_tx_prio_q) {
+        s_tx_prio_q = xQueueCreate(kTxPriorityQueueDepth, sizeof(TxFrame));
+    }
+    if (!s_usb_tx_q) {
+        s_usb_tx_q = xQueueCreate(kUsbTxQueueDepth, sizeof(IoChunk));
+    }
+    if (!s_sniff_q) {
+        s_sniff_q = xQueueCreate(kSniffQueueDepth, sizeof(IoChunk));
+    }
+
     pinMode(kPinRs485Dir, OUTPUT);
     dir_receive();
 
-    /* Muss vor begin() — sonst [E] HardwareSerial „can't be resized when already running" */
-    /* Großer RX: bei vielen GETPOSDG-ACKs + LVGL darf der Puffer nicht überlaufen (sonst Nachlauf-Anzeige). */
     s_hw->setRxBufferSize(4096);
     s_hw->setTxBufferSize(2048);
     s_hw->begin(s_baud, SERIAL_8N1, kPinUartRx, kPinUartTx);
-}
 
-/** true wenn der Bus seit mindestens kBusIdleUs still ist UND keine RX-Bytes anliegen. */
-static bool bus_clear_for_tx()
-{
-    uart_lock();
-    const bool has_rx = (s_hw->available() > 0);
-    uart_unlock();
-    if (has_rx) {
-        return false;
+    if (!s_task_usb_rx) {
+        xTaskCreatePinnedToCore(task_usb_rx, "usb_rx", 4096, nullptr, 4, &s_task_usb_rx, 1);
     }
-    return (uint32_t)(micros() - s_last_bus_activity_us) >= kBusIdleUs;
-}
-
-/**
- * USB → RS485: PC-Daten auf den Bus schicken.
- * Nur wenn der Bus nachweislich idle ist (kein RX, kBusIdleUs Stille).
- * Sonst bleiben die PC-Daten im USB-CDC-Puffer → nächstes poll().
- */
-static void pump_usb_to_hw()
-{
-    if (!bus_clear_for_tx()) {
-        return;
+    if (!s_task_rs485_rx) {
+        xTaskCreatePinnedToCore(task_rs485_rx, "rs485_rx", 4096, nullptr, 5, &s_task_rs485_rx, 1);
     }
-
-    uint8_t buf[kUsbToHwBuf];
-    size_t n = 0;
-    while (Serial.available() && n < sizeof(buf)) {
-        int c = Serial.read();
-        if (c < 0) {
-            break;
-        }
-        buf[n++] = static_cast<uint8_t>(c);
+    if (!s_task_rs485_tx) {
+        xTaskCreatePinnedToCore(task_rs485_tx, "rs485_tx", 4096, nullptr, 4, &s_task_rs485_tx, 1);
     }
-    if (n == 0) {
-        return;
+    if (!s_task_usb_tx) {
+        xTaskCreatePinnedToCore(task_usb_tx, "usb_tx", 4096, nullptr, 3, &s_task_usb_tx, 1);
     }
-
-    uart_lock();
-    dir_transmit();
-    s_hw->write(buf, n);
-    s_hw->flush();
-    if (kTurnaroundMicros) {
-        delayMicroseconds(kTurnaroundMicros);
-    }
-    dir_receive();
-    uart_unlock();
-    s_last_bus_activity_us = micros();
-    rotor_rs485_rx_bytes(buf, n);
-}
-
-/** UART → USB + Parser: komplett leeren (mehrere Blöcke). */
-static void pump_hw_to_usb_and_parser()
-{
-    for (;;) {
-        uint8_t buf[kHwToUsbBuf];
-        size_t n = 0;
-        uart_lock();
-        while (s_hw->available() && n < sizeof(buf)) {
-            int c = s_hw->read();
-            if (c < 0) {
-                break;
-            }
-            buf[n++] = static_cast<uint8_t>(c);
-        }
-        uart_unlock();
-        if (n == 0) {
-            return;
-        }
-        s_last_bus_activity_us = micros();
-        /* Zuerst Parser: SETPOSDG/taget_dg sofort — USB-Spiegel darf nicht vor RX-Parser blockieren */
-        rotor_rs485_rx_bytes(buf, n);
-        mirror_usb_nonblocking(buf, n);
+    if (!s_task_sniffer) {
+        xTaskCreatePinnedToCore(task_sniffer, "rs485_sniff", 4096, nullptr, 2, &s_task_sniffer, 1);
     }
 }
 
 void poll()
 {
-    drain_usb_mirror_pending_to_cdc();
-    /* ERST Bus leeren (Rotor-Antworten), DANN (nur wenn Bus idle) PC-Daten senden. */
-    pump_hw_to_usb_and_parser();
-    pump_usb_to_hw();
-    drain_usb_mirror_pending_to_cdc();
-    yield();
+    if (s_mode == BridgeMode::PcProxyMaster) {
+        if ((uint32_t)(millis() - s_last_pc_frame_ms) > kPcProxyAutoSilenceMs) {
+            s_mode = BridgeMode::LocalMaster;
+        }
+    }
 }
 
 } // namespace serial_bridge

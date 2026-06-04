@@ -32,6 +32,9 @@ typedef void (*rotor_rs485_target_cb_t)(float deg_deg);
 void rotor_rs485_set_master_id(uint8_t id);
 void rotor_rs485_set_slave_id(uint8_t id);
 
+/** Synchronisations-Primitiven (Parser-Mutex) anlegen. Muss VOR serial_bridge::begin()
+ * aufgerufen werden, da task_rs485_rx und task_arbiter konkurrent rotor_rs485_rx_bytes nutzen. */
+void rotor_rs485_pre_begin(void);
 /** Boot: 2 s nach Start erste GETREF, dann optional GETPOSDG (nur wenn referenziert). */
 void rotor_rs485_init(void);
 /** True nach erstem abgeschlossenen Boot-Handshake (GETREF/ggf. GETPOSDG). */
@@ -51,9 +54,10 @@ void rotor_rs485_rx_bytes(const uint8_t *data, size_t len);
 void rotor_rs485_loop(void);
 
 /**
- * True, wenn ein anderer Master (SRC ≠ rotor_rs485_set_master_id) den Rotor (DST = Slave-ID) anfragt
- * und kürzlich Traffic war — dann sendet der Controller kein eigenes GET-Polling (nur Mitlesen).
- * Voraussetzung: PC/Software nutzt eine andere Master-ID als der Controller.
+ * True, wenn der Controller im Mitläufer-Modus arbeiten soll: USB-PC steuert die Brücke, oder am RS485-Bus
+ * spricht kürzlich ein anderer Master den Rotor (DST = Slave-ID) an — auch bei gleicher Master-ID wie der
+ * Controller, sobald die empfangene Zeile nicht unser Echo der zuletzt gesendeten Slave-Unicast-Zeile ist.
+ * Dann kein eigenes GET/TEST-Polling; SETPOSCC (Encoder-Vorschau) geht weiter per RS485 (hw_send_priority).
  */
 bool rotor_rs485_is_foreign_pc_listen_mode(void);
 
@@ -124,9 +128,9 @@ bool rotor_rs485_goto_degrees(float deg);
 
 /**
  * SETPOSCC: Preview-Soll als Payload "<deg>;<rotor_id>" (z. B. "151,30;20"), ohne ACK/Pending.
- * Nur im Mitläufer-Modus (fremder Master spricht den Rotor an): Telegramm geht an diesen Master (DST),
- * nicht an den Rotor — der Slave liefert sonst NAK_SETPOSCC:NOTIMPL. Eigenbetrieb: kein Versand.
- * Wird gequeued und in rotor_rs485_loop geflusht, sobald kein anderes Telegramm aussteht.
+ * DST = konfigurierte Rotor-Slave-ID (wie normale Rotor-Befehle): der Slave liefert ggf. NAK NOTIMPL,
+ * andere Clients erkennen am Ziel (und Payload) den gemeinten Rotor (USB-Spiegel wie andere TX).
+ * Wird gequeued und in rotor_rs485_loop per try_flush gesendet (priorisierter Bus-Slot).
  */
 void rotor_rs485_send_setposcc_degrees(float deg);
 

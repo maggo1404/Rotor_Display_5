@@ -5,8 +5,8 @@
  *
  * Bus-Regel: Pro Anfrage ein ausstehendes Telegramm; nächste Anfrage erst nach ACK (oder Timeout).
  * SETASELECT (DST 255): kein Pending/ACK — sofort senden.
- * SETPOSCC: Encoder-Vorschau nur im Mitläufer-Modus an den fremden Master (DST = dessen SRC-ID), nicht an den
- * Rotor-Slave (NOTIMPL). Eigenbetrieb: kein SETPOSCC — niemand konsumiert es.
+ * SETPOSCC: Encoder-Vorschau — DST = konfigurierte Rotor-Slave-ID (wie SETPOSDG). Der Rotor antwortet nicht sinnvoll
+ * (NAK NOTIMPL), andere Clients filtern nach DST bzw. Payload „deg;rotor_id“ (USB-Spiegel wie bisher).
  * SETCONIDF / SETCONTID (DST 255): neue Controller-master_id → config.json + ACK_SETCONIDF bzw. ACK_SETCONTID.
  * GETANEMO/GETTEMPA/GETWINDDIR/GETTEMPM: nur Stillstand, ohne Fremd-PC; ACKs auch bei PC-Mitlesen.
  * GETCONANO/SETCONANO: Anemometer/Wetter-Tab (1/0) in config.json; bei 0 weiter GETTEMPA (Außentemp Rotor-Info).
@@ -17,14 +17,15 @@
  *
  * Verbindung: Fehler 10 (Verbindungstimeout), wenn länger kein Telegramm vom Slave (SRC=Rotor-ID)
  * oder vor erster Antwort nur Timeouts — PC- oder Controller-Abfragen zählen (ROTOR_CONN_LOST_TIMEOUT_MS).
- * Fehler 10: GETERR-Recovery bis ACK_ERR (nicht GETREF zuerst — ref=1 trotz Slave-Fehler möglich).
+ * Ausnahme: während Homing (s_poll_ref/s_request_pos_after_homing) kein Link-Watchdog — Referenzfahrt kann stumm sein.
+ * Fehler 10: bei ausbleibender Antwort periodisch GETREF (ROTOR_CONN_RECOVERY_GETREF_MS), bis der Slave
+ * wieder antwortet; danach Referenz/GETPOSDG wie bei Boot. GETERR/ACK_ERR bleibt für echte Slave-Fehler.
  * Boot: zuerst 3× TEST:0 (Ping, je ROTOR_RS485_ACK_TIMEOUT_MS); ohne ACK_TEST/NAK_TEST → sofort Fehler 10.
  *
- * Zweiter Master auf demselben RS485-Segment (eigenes PC-Interface, nicht „durch den Controller“ gebündelt):
- * gleiche Master-ID wie Display → ACK_GETPOSDG/ACK_SETPOSDG am Bus nicht zuordenbar, Pending kann falsch
- * gelöst werden. PC dann andere Master-ID als der Controller (config.json master_id).
- * Liest die PC-Software nur den USB-Mitschnitt des Controllers (kein eigener Bus-TX auf dieselbe Leitung),
- * entsteht dieses ACK-Problem durch den PC nicht.
+ * Zweiter Master auf demselben RS485-Segment: Mitläufer-Modus wenn DST = Rotor-Slave-ID und SRC ein
+ * anderer Master ist, oder SRC = eigene Master-ID aber andere Zeile als unser letzter TX (gleiche ID).
+ * Gleiche Master-ID ohne Bus-Echo: jede fremde Unicast-Zeile löst Mitläufer aus; Echo der eigenen Zeile
+ * innerhalb ROTOR_OWN_DST_SLAVE_LINE_MATCH_MS wird ignoriert.
  *
  * Fremd-Master auf dem Bus (z. B. PC ID 1, Display ID 2): früher wurde komplett kein eigenes GETPOSDG
  * mehr gesendet und GETPOSDG-Timeouts löschten das Pending — Ist lief nur über fremde ACKs → Nachlaufen.
@@ -40,13 +41,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 #include "pwm_config.h"
 #include "rotor_app.h"
 #include "rotor_error_app.h"
 #include "serial_bridge.h"
 
 extern "C" void rotor_app_antenna_offset_changed(void);
-extern "C" void rotor_app_apply_remote_antenna_selection(uint8_t n_1_to_3);
 
 #ifndef ROTOR_RS485_MASTER_ID
 #define ROTOR_RS485_MASTER_ID 2u
@@ -89,6 +92,11 @@ extern "C" void rotor_app_apply_remote_antenna_selection(uint8_t n_1_to_3);
 #define ROTOR_PERIODIC_GETREF_MS 5000u
 #endif
 
+/** Bei Fehler 10 (Verbindungstimeout): GETREF-Intervall bis der Rotor wieder antwortet */
+#ifndef ROTOR_CONN_RECOVERY_GETREF_MS
+#define ROTOR_CONN_RECOVERY_GETREF_MS 2000u
+#endif
+
 /** GETERR bei Timeout: maximal so viele Wiederholungen vor Cooldown (nur fuer manuelle GETERR-Abfragen). */
 #ifndef ROTOR_GETERR_MAX_RETRIES
 #define ROTOR_GETERR_MAX_RETRIES 1u
@@ -97,6 +105,10 @@ extern "C" void rotor_app_apply_remote_antenna_selection(uint8_t n_1_to_3);
 /** Kein Fremd-Master → Rotor mehr so lange → eigenes GET-Polling wieder an */
 #ifndef ROTOR_PC_FOREIGN_SILENCE_MS
 #define ROTOR_PC_FOREIGN_SILENCE_MS 3000u
+#endif
+/** RX-Zeile gleich unserem letzten TX an den Slave innerhalb dieses Fensters → Echo, kein „Fremd mit gleicher Master-ID“. */
+#ifndef ROTOR_OWN_DST_SLAVE_LINE_MATCH_MS
+#define ROTOR_OWN_DST_SLAVE_LINE_MATCH_MS 280u
 #endif
 
 /** Referenz + Betrieb: keine Antwort vom Rotor (Slave) seit so lang → Fehler 10 Verbindungstimeout
@@ -141,6 +153,29 @@ enum class Pending : uint8_t {
     Test
 };
 
+static bool is_proxy_blocked_poll_pending(Pending p)
+{
+    switch (p) {
+    case Pending::GetRef:
+    case Pending::GetPosDg:
+    case Pending::GetErr:
+    case Pending::GetAntOff1:
+    case Pending::GetAntOff2:
+    case Pending::GetAntOff3:
+    case Pending::GetAngle1:
+    case Pending::GetAngle2:
+    case Pending::GetAngle3:
+    case Pending::GetAnemo:
+    case Pending::GetTempA:
+    case Pending::GetWindDir:
+    case Pending::GetTempM:
+    case Pending::Test:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static uint8_t s_master_id = ROTOR_RS485_MASTER_ID;
 static uint8_t s_slave_id = ROTOR_RS485_SLAVE_ID;
 
@@ -150,11 +185,38 @@ static rotor_rs485_target_cb_t s_target_cb = nullptr;
 
 /** Nicht im UART-Parser: rotor_app_antenna_offset_changed (Flash nicht im Parser) */
 static bool s_pending_antenna_offset_notify = false;
-/** SET* config: pwm_config_save + UI (LVGL) in rotor_rs485_idle_tasks */
+/** SET* config: UI (LVGL) in rotor_rs485_idle_tasks; config.json siehe s_pending_pwm_config_save */
 static bool s_pending_config_changed_from_bus = false;
+/** config.json: pwm_config_save() nur im Haupt-loop, nicht im RS485-/USB-Parser (Proxy/FFat/WDT). */
+static bool s_pending_pwm_config_save = false;
+
+static inline void schedule_pwm_config_save_from_bus(void)
+{
+    s_pending_pwm_config_save = true;
+}
+
+/** SETASELECT per Bus/USB: Flash/LVGL nur in rotor_rs485_idle_tasks (nicht Parser-/Bridge-Task). */
+static bool s_pending_remote_antenna = false;
+static uint8_t s_remote_ant_orig_prev = 1;
+static uint8_t s_remote_ant_new = 1;
+
+static void queue_remote_antenna_apply(uint8_t prev, uint8_t n)
+{
+    if (n < 1u || n > 3u || prev < 1u || prev > 3u || prev == n) {
+        return;
+    }
+    if (!s_pending_remote_antenna) {
+        s_remote_ant_orig_prev = prev;
+    }
+    s_remote_ant_new = n;
+    s_pending_remote_antenna = true;
+}
 
 /** Viele ACK_GETPOSDG in einem poll(): Ist-Callback nur einmal pro loop() — sonst blockiert LVGL die UART-Verarbeitung. */
 static bool s_pos_ui_deferred = false;
+/** GETREF-Status in loop() flushen (kein LVGL-Lock im RX-Task). */
+static bool s_ref_ui_deferred = false;
+static bool s_ref_ui_value = false;
 
 /** ACK_GETANEMO / ACK_GETTEMPA / ACK_GETTEMPM / ACK_WINDDIR (Anzeige in loop(), nicht im Parser) */
 static float s_last_wind_kmh = 0.0f;
@@ -190,12 +252,19 @@ static bool s_startup_err_known = false;
 static bool s_align_target_after_pos_read = false;
 /** Nach SETREF/Homing: bei nächstem GETREF=referenziert einmal GETPOSDG anfordern */
 static bool s_request_pos_after_homing = false;
+/** Homing-Start aus Referenz-Zustand: erstes verfrühtes GETREF=1 ignorieren, bis einmal GETREF=0 kam. */
+static bool s_homing_wait_unref_seen = false;
 
 /** Lange Telegramme: ACK_GETACCBINS/GETCALBINS/… (viele Semikolon-getrennte Zahlen) — 320 war zu knapp */
 static char s_rx[1536];
 static size_t s_rx_len = 0;
 /** Puffer voll: bis zum nächsten „#“ verwerfen (sonst Mittendrin-Bytes → Müll im Log) */
 static bool s_rx_resync_until_hash = false;
+/** rotor_rs485_rx_bytes wird aus task_rs485_rx (Bus-RX) und task_arbiter (PC-TX-Sniff)
+ * konkurrent aufgerufen — beide Tasks gleicher Prio/Core. Ohne Mutex mischen sich Bytes
+ * im s_rx[]-Akkumulator und parse_ack_getref sieht zufällig „:ACK_GETREF:1:“-Substrings,
+ * was während Homing fälschlich „referenziert“ erkennt → Ring-Kreiseln stoppt vorzeitig. */
+static SemaphoreHandle_t s_parser_mutex = nullptr;
 
 /** Zuletzt aus ACK_GETREF (für UI / Taster / LED) */
 static bool s_slave_referenced = false;
@@ -203,6 +272,8 @@ static bool s_slave_referenced = false;
 static float s_last_pos_ui_deg = 0.0f;
 /** GETREF alle ROTOR_PERIODIC_GETREF_MS nach Boot, solange kein Homing-Polling */
 static uint32_t s_next_periodic_getref_ms = 0;
+/** Nächstes ACK_GETREF ist die Antwort auf ein GETREF im Zustand Verbindungstimeout (Fehler 10) */
+static bool s_err10_recovery_getref_pending = false;
 
 /** SETPOSCC: zuletzt gewünschter Busgrad — Versand erst in rotor_rs485_loop bei freiem Pending (kein TX vor ACK/GETPOS). */
 static bool s_setposcc_queued = false;
@@ -229,8 +300,12 @@ static uint8_t s_angle_boot_phase = 0;
 
 /** Zuletzt #FremdMaster:RotorID:… gesehen (Millis); 0 = noch keiner */
 static uint32_t s_last_foreign_master_to_slave_ms = 0;
-/** Zuletzt gesehener Master (SRC), der unseren Slave (DST=Rotor-ID) angesprochen hat — Ziel für SETPOSCC im Mitläufer-Modus */
+/** Zuletzt gesehener Master (SRC), der unseren Slave (DST=Rotor-ID) angesprochen hat — Mitläufer-Erkennung */
 static uint8_t s_foreign_master_src_id = 0;
+
+/** Letztes von uns gesendetes Unicast an s_slave_id (Vollzeile inkl. $) — Kollision zweier Master gleicher ID. */
+static char s_last_own_dst_slave_line[192];
+static uint32_t s_last_own_dst_slave_line_ms = 0;
 
 /** Zuletzt ein gültiges Telegramm mit SRC = Slave-ID (ACK/NAK/ERR …) — Verbindungs-Watchdog */
 static uint32_t s_last_slave_rx_ms = 0;
@@ -262,6 +337,7 @@ static void abort_antenna_boot(void)
 
 static void notify_target(float deg);
 static void flush_deferred_position_ui(void);
+static void flush_deferred_ref_ui(void);
 static void try_flush_setposcc(void);
 
 /** Bei Fehler stoppt der Slave — kein weiteres GETPOSDG-Polling / keine ausstehende Pos-Sync bis Recovery */
@@ -275,6 +351,7 @@ static void stop_fault_motion_polling(void)
     s_hw_snap_retarget_active = false;
     s_poll_ref = false;
     s_request_pos_after_homing = false;
+    s_homing_wait_unref_seen = false;
 }
 
 void rotor_rs485_set_master_id(uint8_t id) { s_master_id = id; }
@@ -287,6 +364,15 @@ void rotor_rs485_set_target_callback(rotor_rs485_target_cb_t cb) { s_target_cb =
 void rotor_rs485_idle_tasks(void)
 {
     flush_deferred_position_ui();
+    flush_deferred_ref_ui();
+    if (s_pending_pwm_config_save) {
+        s_pending_pwm_config_save = false;
+        pwm_config_save();
+    }
+    if (s_pending_remote_antenna) {
+        s_pending_remote_antenna = false;
+        rotor_app_apply_remote_antenna_selection_deferred(s_remote_ant_orig_prev, s_remote_ant_new);
+    }
     if (s_pending_antenna_offset_notify) {
         s_pending_antenna_offset_notify = false;
         rotor_app_antenna_offset_changed();
@@ -330,9 +416,14 @@ bool rotor_rs485_is_startup_error_checked(void) { return s_startup_err_known; }
 
 bool rotor_rs485_is_referenced(void) { return s_slave_referenced; }
 
-bool rotor_rs485_is_moving(void) { return s_poll_pos || s_poll_ref; }
+static bool homing_active_internal(void)
+{
+    return (s_poll_ref || s_request_pos_after_homing) && !s_slave_referenced;
+}
 
-bool rotor_rs485_is_homing(void) { return s_poll_ref && !s_slave_referenced; }
+bool rotor_rs485_is_moving(void) { return s_poll_pos || homing_active_internal(); }
+
+bool rotor_rs485_is_homing(void) { return homing_active_internal(); }
 
 bool rotor_rs485_is_position_polling(void) { return s_poll_pos; }
 
@@ -342,20 +433,15 @@ float rotor_rs485_get_last_position_deg(void) { return s_last_pos_ui_deg; }
 
 bool rotor_rs485_is_foreign_pc_listen_mode(void)
 {
+    /* USB-Bridge (PC steuert): lokale Hintergrund-GETs drosseln, auch wenn PC dieselbe Master-ID nutzt. */
+    if (serial_bridge::get_mode() == serial_bridge::BridgeMode::PcProxyMaster) {
+        return true;
+    }
+    /* Reiner RS485-Mitläufer: anderer Master spricht unseren Rotor an (auch gleiche Master-ID wie wir). */
     if (s_last_foreign_master_to_slave_ms == 0) {
         return false;
     }
     return (millis() - s_last_foreign_master_to_slave_ms) < ROTOR_PC_FOREIGN_SILENCE_MS;
-}
-
-/** SETPOSCC an fremden Master: nur wenn Mitläufer-Fenster aktiv — oder lokale Positionsfahrt (GETPOSDG-Polling),
- * sonst verfällt das 3s-Silence-Fenster ohne PC-Telegramm zum Slave und die Vorschau stoppt mitten in der Fahrt. */
-static bool cc_preview_to_foreign_allowed(void)
-{
-    if (rotor_rs485_is_foreign_pc_listen_mode()) {
-        return true;
-    }
-    return s_foreign_master_src_id != 0 && s_poll_pos;
 }
 
 static void clear_pending()
@@ -384,6 +470,8 @@ static bool pending_timed_out()
     uint32_t timeout_ms = ROTOR_RS485_ACK_TIMEOUT_MS;
     if (s_pending == Pending::SetPosDg) {
         timeout_ms = ROTOR_RS485_SETPOSDG_ACK_TIMEOUT_MS;
+    } else if (s_pending == Pending::GetRef && rotor_error_app_get_error_code() == 10) {
+        timeout_ms = ROTOR_CONN_RECOVERY_GETREF_MS;
     }
     return (millis() - s_pending_since_ms) >= timeout_ms;
 }
@@ -519,6 +607,17 @@ static bool bus_send_allowed_by_fault(void)
     return e == 0 || e == 10;
 }
 
+static bool is_recent_own_dst_slave_line(const char *line)
+{
+    if (s_last_own_dst_slave_line_ms == 0 || s_last_own_dst_slave_line[0] == '\0') {
+        return false;
+    }
+    if ((uint32_t)(millis() - s_last_own_dst_slave_line_ms) >= ROTOR_OWN_DST_SLAVE_LINE_MATCH_MS) {
+        return false;
+    }
+    return strcmp(line, s_last_own_dst_slave_line) == 0;
+}
+
 static void send_line_to(uint8_t dst, const char *cmd, const char *params_str)
 {
     if (!bus_send_allowed_by_fault()) {
@@ -530,6 +629,11 @@ static void send_line_to(uint8_t dst, const char *cmd, const char *params_str)
     format_cs_python(cs, sizeof(cs), cs_val);
     char line[192];
     snprintf(line, sizeof(line), "#%u:%u:%s:%s:%s$", (unsigned)s_master_id, (unsigned)dst, cmd, params_str, cs);
+    if ((unsigned)dst == (unsigned)s_slave_id) {
+        strncpy(s_last_own_dst_slave_line, line, sizeof(s_last_own_dst_slave_line) - 1);
+        s_last_own_dst_slave_line[sizeof(s_last_own_dst_slave_line) - 1] = '\0';
+        s_last_own_dst_slave_line_ms = millis();
+    }
     // SETPOSCC-Vorschau muss bei laufender Fremd-GETPOSDG-Flut sofort raus.
     if (strcmp(cmd, "SETPOSCC") == 0) {
         serial_bridge::hw_send_priority(reinterpret_cast<const uint8_t *>(line), strlen(line));
@@ -546,6 +650,9 @@ static void send_line(const char *cmd, const char *params_str)
 static void send_request(const char *cmd, const char *params_str, Pending p)
 {
     if (!bus_send_allowed_by_fault()) {
+        return;
+    }
+    if (rotor_rs485_is_foreign_pc_listen_mode() && is_proxy_blocked_poll_pending(p)) {
         return;
     }
     send_line(cmd, params_str);
@@ -572,12 +679,20 @@ void rotor_rs485_send_getref(void)
 
 void rotor_rs485_send_setref_homing(void)
 {
-    if (s_pending != Pending::None) {
+    /* Laufende Positions-Telegramme abbrechen, sonst blockiert pending == SetPosDg den Homing-Start */
+    if (s_pending == Pending::SetPosDg || s_pending == Pending::GetPosDg) {
+        clear_pending();
+        s_poll_pos = false;
+        s_pos_grace_end_ms = 0;
+        s_hw_snap_retarget_active = false;
+        s_setposdg_retry_count = 0;
+    } else if (s_pending != Pending::None) {
         return;
     }
     send_request("SETREF", "1", Pending::SetRef);
     s_poll_ref = true;
     s_request_pos_after_homing = true;
+    s_homing_wait_unref_seen = true;
 }
 
 bool rotor_rs485_send_stop(void)
@@ -597,6 +712,7 @@ bool rotor_rs485_send_stop(void)
     s_pos_grace_end_ms = 0;
     s_poll_ref = false;
     s_request_pos_after_homing = false;
+    s_homing_wait_unref_seen = false;
     s_remote_setpos_motion = false;
     s_remote_setpos_grace_end_ms = 0;
     send_request("STOP", "0", Pending::Stop);
@@ -651,6 +767,10 @@ bool rotor_rs485_send_set_pwm_limit(uint8_t pct)
 
 bool rotor_rs485_goto_degrees(float deg)
 {
+    /* Ohne Slave-Referenz lehnt der Rotor SETPOSDG mit NOREF ab — nicht senden (verhindert NAK-/Retry-Sturm). */
+    if (!s_slave_referenced) {
+        return false;
+    }
     /* SETPOSDG hat Vorrang: ausstehende Abfragen sofort abbrechen, damit Encoder-Ziel ohne
      * GETREF/GETERR/Weather-Wartekette direkt gesendet wird. */
     if (s_pending == Pending::SetPosDg) {
@@ -690,28 +810,19 @@ static void try_flush_setposcc(void)
     if (!s_setposcc_queued || !bus_send_allowed_by_fault()) {
         return;
     }
-    if (!cc_preview_to_foreign_allowed()) {
-        s_setposcc_queued = false;
-        return;
-    }
-    if (s_foreign_master_src_id == 0) {
-        return;
-    }
     char deg_buf[40];
     format_deg_param(deg_buf, sizeof(deg_buf), s_setposcc_queued_deg);
     char p[64];
     // SETPOSCC-Payload: "<deg>;<rotor_id>" damit der fremde Master den richtigen Rotor zuordnen kann.
     snprintf(p, sizeof(p), "%s;%u", deg_buf, (unsigned)s_slave_id);
-    send_line_to(s_foreign_master_src_id, "SETPOSCC", p);
+    /* DST = eingestellte Rotor-ID: Slave ignoriert/NAK, andere Bus-Clients ordnen eindeutig zu. */
+    send_line_to(s_slave_id, "SETPOSCC", p);
     s_setposcc_queued = false;
 }
 
 void rotor_rs485_send_setposcc_degrees(float deg)
 {
     if (!bus_send_allowed_by_fault()) {
-        return;
-    }
-    if (!cc_preview_to_foreign_allowed()) {
         return;
     }
     s_setposcc_queued_deg = normalize_deg_0_360(deg);
@@ -721,6 +832,10 @@ void rotor_rs485_send_setposcc_degrees(float deg)
 static void try_hw_snap_retarget(void)
 {
     if (!s_hw_snap_retarget_active) {
+        return;
+    }
+    if (!s_slave_referenced) {
+        s_hw_snap_retarget_active = false;
         return;
     }
     (void)rotor_rs485_goto_degrees(s_hw_snap_retarget_deg);
@@ -735,9 +850,13 @@ void rotor_rs485_hw_snap_retarget_request(float deg)
 
 static void notify_ref(bool ref_ok)
 {
+    const bool changed = (s_slave_referenced != ref_ok);
     s_slave_referenced = ref_ok;
-    if (s_ref_cb) {
-        s_ref_cb(ref_ok);
+    /* ACK_GETREF kommt waehrend Homing sehr haeufig. LVGL-Updates nur bei
+     * Zustandswechsel und dann im loop()-Kontext ausführen. */
+    if (changed) {
+        s_ref_ui_value = ref_ok;
+        s_ref_ui_deferred = true;
     }
 }
 
@@ -758,6 +877,15 @@ static void flush_deferred_position_ui(void)
     }
     s_pos_ui_deferred = false;
     s_pos_cb(s_last_pos_ui_deg);
+}
+
+static void flush_deferred_ref_ui(void)
+{
+    if (!s_ref_ui_deferred || !s_ref_cb) {
+        return;
+    }
+    s_ref_ui_deferred = false;
+    s_ref_cb(s_ref_ui_value);
 }
 
 static void notify_target(float deg)
@@ -1136,7 +1264,7 @@ static void handle_broadcast_set_controller_master_id(const char *line, unsigned
         return;
     }
     pwm_config_set_master_id((uint8_t)v);
-    pwm_config_save();
+    schedule_pwm_config_save_from_bus();
     rotor_rs485_set_master_id((uint8_t)v);
     s_pending_config_changed_from_bus = true;
     char p[8];
@@ -1180,7 +1308,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_rotor_id((uint8_t)v);
-        pwm_config_save();
+        schedule_pwm_config_save_from_bus();
         s_pending_config_changed_from_bus = true;
         config_reply_ack_u8(src, "ACK_SETCONRID", (uint8_t)v);
         return true;
@@ -1206,7 +1334,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_master_id((uint8_t)v);
-        pwm_config_save();
+        schedule_pwm_config_save_from_bus();
         s_pending_config_changed_from_bus = true;
         config_reply_ack_u8(src, "ACK_SETCONTID", (uint8_t)v);
         return true;
@@ -1232,7 +1360,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_slow((uint8_t)v);
-        pwm_config_save();
+        schedule_pwm_config_save_from_bus();
         s_pending_config_changed_from_bus = true;
         config_reply_ack_u8(src, "ACK_SETCONSPWM", (uint8_t)v);
         return true;
@@ -1258,7 +1386,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_fast((uint8_t)v);
-        pwm_config_save();
+        schedule_pwm_config_save_from_bus();
         s_pending_config_changed_from_bus = true;
         config_reply_ack_u8(src, "ACK_SETCONFPWM", (uint8_t)v);
         return true;
@@ -1284,7 +1412,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_touch_beep_freq_hz((uint16_t)v);
-        pwm_config_save();
+        schedule_pwm_config_save_from_bus();
         config_reply_ack_u16(src, "ACK_SETCONFRQ", pwm_config_get_touch_beep_freq_hz());
         return true;
     }
@@ -1309,7 +1437,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_touch_beep_vol((uint8_t)v);
-        pwm_config_save();
+        schedule_pwm_config_save_from_bus();
         config_reply_ack_u8(src, "ACK_SETLSL", pwm_config_get_touch_beep_vol());
         return true;
     }
@@ -1334,7 +1462,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_anemometer((uint8_t)v);
-        pwm_config_save();
+        schedule_pwm_config_save_from_bus();
         s_pending_config_changed_from_bus = true;
         config_reply_ack_u8(src, "ACK_SETCONANO", pwm_config_get_anemometer());
         return true;
@@ -1360,7 +1488,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_encoder_delta_tenths((uint8_t)v);
-        pwm_config_save();
+        schedule_pwm_config_save_from_bus();
         s_pending_config_changed_from_bus = true;
         config_reply_ack_u8(src, "ACK_SETCONDELTA", pwm_config_get_encoder_delta_tenths());
         return true;
@@ -1386,7 +1514,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_concha((uint8_t)v);
-        pwm_config_save();
+        schedule_pwm_config_save_from_bus();
         s_pending_config_changed_from_bus = true;
         config_reply_ack_u8(src, "ACK_SETCONCHA", pwm_config_get_concha());
         return true;
@@ -1412,7 +1540,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_led_ring_brightness_pct((uint8_t)v);
-        pwm_config_save();
+        schedule_pwm_config_save_from_bus();
         s_pending_config_changed_from_bus = true;
         config_reply_ack_u8(src, "ACK_SETCONLEDP", pwm_config_get_led_ring_brightness_pct());
         return true;
@@ -1456,7 +1584,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
                 return true;
             }
             pwm_config_set_antenna_label(ant[i].idx, par);
-            pwm_config_save();
+            schedule_pwm_config_save_from_bus();
             s_pending_config_changed_from_bus = true;
             config_reply_ack_label(src, ant[i].ack_set, pwm_config_get_antenna_label(ant[i].idx));
             return true;
@@ -1474,7 +1602,8 @@ static void dispatch_bus_command_to_slave(const char *line, unsigned src)
     {
         unsigned ant = 0;
         if (parse_setaselect_antenna_1_to_3(line, &ant)) {
-            rotor_app_apply_remote_antenna_selection((uint8_t)ant);
+            const uint8_t prev = pwm_config_get_last_antenna();
+            queue_remote_antenna_apply(prev, (uint8_t)ant);
             return;
         }
     }
@@ -1486,6 +1615,7 @@ static void dispatch_bus_command_to_slave(const char *line, unsigned src)
         if (parse_setref_command_param(line, &ref_cmd) && ref_cmd != 0) {
             s_poll_ref = true;
             s_request_pos_after_homing = true;
+            s_homing_wait_unref_seen = true;
             s_next_ref_poll_ms = millis() + ROTOR_POLL_GAP_MS;
         }
     }
@@ -1512,35 +1642,25 @@ static void on_ack_timeout()
     if (!pending_timed_out()) {
         return;
     }
-    /* Fremd-Master bedient den Rotor: eigene GET-*-Pending nicht endlos wiederholen (Kollision).
-     * Ausnahme: lokale Positionsfahrt / Homing — sonst kein eigenes GETPOSDG/GETREF und Ist nur aus fremden ACKs. */
+    /* Proxy/Fremd-Master bedient den Rotor: eigene GET-*-Pendings nie wiederholen.
+     * Im Proxy soll der Controller den Rotor nicht pollen; Ist/Ref kommen aus mitgesnifften ACKs. */
     if (rotor_rs485_is_foreign_pc_listen_mode()) {
         switch (s_pending) {
         case Pending::GetRef:
-            if (s_poll_ref) {
-                break;
-            }
-            clear_pending();
-            return;
         case Pending::GetPosDg:
-            if (s_poll_pos) {
-                break;
-            }
-            clear_pending();
-            return;
         case Pending::GetErr:
         case Pending::GetAnemo:
         case Pending::GetTempA:
         case Pending::GetWindDir:
         case Pending::GetTempM:
+        case Pending::GetAntOff1:
+        case Pending::GetAntOff2:
+        case Pending::GetAntOff3:
         case Pending::GetAngle1:
         case Pending::GetAngle2:
         case Pending::GetAngle3:
-            clear_pending();
-            return;
         case Pending::Test:
             clear_pending();
-            s_boot_test_done = true;
             return;
         default:
             break;
@@ -1875,14 +1995,31 @@ static bool parse_ack_getref(const char *line)
         p++;
     }
     valbuf[i] = '\0';
-    int v = (int)(strtof(valbuf, nullptr) + 0.5f);
-    bool ref_ok = (v != 0);
+    const int v = (int)(strtof(valbuf, nullptr) + 0.5f);
+    const bool ref_ok_raw = (v != 0);
+    /* Einige Rotoren liefern direkt nach SETREF kurz noch GETREF=1, obwohl Homing schon läuft.
+     * Damit die UI nicht vorzeitig von "Referenziere" auf "Nicht referenziert" springt:
+     * während aktivem Homing erst einmal GETREF=0 sehen, dann das nächste GETREF=1 akzeptieren. */
+    if (s_poll_ref && s_request_pos_after_homing && s_homing_wait_unref_seen && !ref_ok_raw) {
+        s_homing_wait_unref_seen = false;
+    }
+    const bool ref_ok = (s_poll_ref && s_request_pos_after_homing && s_homing_wait_unref_seen) ? false : ref_ok_raw;
     const bool was_referenced = s_slave_referenced;
     notify_ref(ref_ok);
     const bool became_referenced = ref_ok && !was_referenced;
 
     if (s_pending == Pending::GetRef) {
         clear_pending();
+    }
+
+    if (s_err10_recovery_getref_pending) {
+        s_err10_recovery_getref_pending = false;
+        if (ref_ok) {
+            s_poll_ref = false;
+            s_align_target_after_pos_read = true;
+            send_request("GETPOSDG", "0", Pending::GetPosDg);
+        }
+        return true;
     }
 
     /* Boot vor Homing-Logik: GETREF → ggf. GETPOSDG */
@@ -1901,6 +2038,7 @@ static bool parse_ack_getref(const char *line)
     if (ref_ok && s_request_pos_after_homing) {
         s_request_pos_after_homing = false;
         s_poll_ref = false;
+        s_homing_wait_unref_seen = false;
         /* Sonst kein GETPOSDG — Ist bleibt „-“, Soll nicht angeglichen (nur Controller, kein PC) */
         s_align_target_after_pos_read = true;
         send_request("GETPOSDG", "0", Pending::GetPosDg);
@@ -1913,6 +2051,7 @@ static bool parse_ack_getref(const char *line)
      */
     if (became_referenced && s_pending == Pending::None) {
         s_poll_ref = false;
+        s_homing_wait_unref_seen = false;
         s_align_target_after_pos_read = true;
         send_request("GETPOSDG", "0", Pending::GetPosDg);
         return true;
@@ -1920,6 +2059,12 @@ static bool parse_ack_getref(const char *line)
 
     if (ref_ok) {
         s_poll_ref = false;
+        s_homing_wait_unref_seen = false;
+    } else if (s_request_pos_after_homing) {
+        /* Robust gegen sporadisches ungewolltes Zurücksetzen von s_poll_ref:
+         * solange Homing noch nicht referenziert ist, GETREF-Polling erzwingen. */
+        s_poll_ref = true;
+        s_next_ref_poll_ms = millis() + ROTOR_POLL_GAP_MS;
     } else if (s_poll_ref) {
         s_next_ref_poll_ms = millis() + ROTOR_POLL_GAP_MS;
     }
@@ -2051,7 +2196,14 @@ static bool parse_nak_and_clear(const char *line)
 {
     if (strstr(line, ":NAK_GETREF:") && s_pending == Pending::GetRef) {
         clear_pending();
-        s_request_pos_after_homing = false;
+        /* Während aktivem Homing darf ein einzelnes NAK_GETREF den Homing-Zyklus nicht abbrechen.
+         * Sonst stoppt Ring-"Kreiseln" vorzeitig und UI springt auf "Nicht referenziert". */
+        if (s_poll_ref) {
+            s_next_ref_poll_ms = millis() + ROTOR_POLL_GAP_MS;
+        } else {
+            s_request_pos_after_homing = false;
+            s_homing_wait_unref_seen = false;
+        }
         if (!s_boot_done && s_boot_phase == 1) {
             s_boot_done = true;
             s_boot_phase = 3;
@@ -2078,15 +2230,20 @@ static bool parse_nak_and_clear(const char *line)
         if (!line_src_dst(line, &nsrc, &ndst) || ndst != (unsigned)s_master_id) {
             return false;
         }
+        if (strstr(line, ":NAK_SETPOSDG:NOREF:")) {
+            notify_ref(false);
+        }
         clear_pending();
         s_poll_pos = false;
         s_pos_grace_end_ms = 0;
+        s_hw_snap_retarget_active = false;
         return true;
     }
     if (strstr(line, ":NAK_SETREF:") && s_pending == Pending::SetRef) {
         clear_pending();
         s_poll_ref = false;
         s_request_pos_after_homing = false;
+        s_homing_wait_unref_seen = false;
         return true;
     }
     if (strstr(line, ":NAK_TEST:") && s_pending == Pending::Test) {
@@ -2219,10 +2376,16 @@ static void process_complete_line(const char *line, size_t len)
         return;
     }
 
-    /* Anderer Master spricht unseren Rotor an → Mitläufer-Modus (GET-Polling aus loop aussetzen). */
-    if (dst == (unsigned)s_slave_id && src != (unsigned)s_master_id) {
-        s_last_foreign_master_to_slave_ms = millis();
-        s_foreign_master_src_id = (uint8_t)src;
+    /* Fremder Verkehr an unseren Rotor (Slave): Mitläufer-Modus. Auch SRC = unsere Master-ID, wenn es
+     * nicht unser Echo der zuletzt gesendeten Zeile ist (zwei Geräte mit gleicher master_id am Bus). */
+    if (dst == (unsigned)s_slave_id && src != (unsigned)s_slave_id) {
+        const bool other_master = (src != (unsigned)s_master_id);
+        const bool same_master_foreign =
+            (src == (unsigned)s_master_id) && !is_recent_own_dst_slave_line(line);
+        if (other_master || same_master_foreign) {
+            s_last_foreign_master_to_slave_ms = millis();
+            s_foreign_master_src_id = (uint8_t)src;
+        }
     }
 
     /* Befehl an den Slave (beliebiger Master): Start Timeout-Uhr „noch keine Slave-Antwort“ (z. B. nur PC) */
@@ -2253,7 +2416,8 @@ static void process_complete_line(const char *line, size_t len)
                     s_last_foreign_master_to_slave_ms = millis();
                     s_foreign_master_src_id = (uint8_t)src;
                 }
-                rotor_app_apply_remote_antenna_selection((uint8_t)v);
+                const uint8_t prev = pwm_config_get_last_antenna();
+                queue_remote_antenna_apply(prev, (uint8_t)v);
             }
         }
         return;
@@ -2375,13 +2539,33 @@ void rotor_rs485_rx_bytes(const uint8_t *data, size_t len)
     if (!data || len == 0) {
         return;
     }
+    /* Race auf s_rx[]/s_rx_len/s_rx_resync_until_hash zwischen task_rs485_rx (Bus-RX) und
+     * task_arbiter (PC-TX-Sniff) verhindern — sonst mischen sich Bytes aus zwei Frames im
+     * gleichen Buffer und parse_ack_getref sieht zufällig „:ACK_GETREF:1:" → vorzeitiges
+     * Homing-Ende. portMAX_DELAY ist hier sicher: gehaltene Sektion ist nur das Akkumulieren
+     * + ein parse_*-Aufruf, ~µs Größenordnung; ohne Lock GIBT ES GARANTIERT Korruption. */
+    if (s_parser_mutex) {
+        xSemaphoreTake(s_parser_mutex, portMAX_DELAY);
+    }
     for (size_t i = 0; i < len; i++) {
         process_rx_byte(static_cast<int>(data[i]) & 0xff);
+    }
+    if (s_parser_mutex) {
+        xSemaphoreGive(s_parser_mutex);
+    }
+}
+
+void rotor_rs485_pre_begin(void)
+{
+    if (!s_parser_mutex) {
+        s_parser_mutex = xSemaphoreCreateMutex();
     }
 }
 
 void rotor_rs485_init(void)
 {
+    rotor_rs485_pre_begin();
+    s_err10_recovery_getref_pending = false;
     s_boot_test_done = false;
     s_boot_test_timeout_count = 0;
     s_last_slave_rx_ms = 0;
@@ -2398,9 +2582,14 @@ void rotor_rs485_init(void)
     s_next_weather_ms = millis() + 2000u;
     s_weather_phase = 0;
     s_next_motortemp_ms = millis() + 2000u;
+    s_last_own_dst_slave_line[0] = '\0';
+    s_last_own_dst_slave_line_ms = 0;
     s_setposcc_queued = false;
     s_setposdg_retry_count = 0;
     s_geterr_retry_count = 0;
+    s_pos_ui_deferred = false;
+    s_ref_ui_value = s_slave_referenced;
+    s_ref_ui_deferred = true;
 }
 
 /** Erstes Paket nach Einschalten: TEST (Ping), 3 Versuche ohne ACK → Fehler 10 */
@@ -2481,7 +2670,7 @@ static void try_antenna_boot_first_get(void)
  * anemometer=0: nur GETTEMPA (Außentemp im Tab Rotor_Info, kein Wind-Tab). */
 static void try_weather_poll(void)
 {
-    if (!s_boot_done || s_poll_pos || s_poll_ref) {
+    if (!s_boot_done || s_poll_pos || homing_active_internal()) {
         return;
     }
     if (s_antenna_boot_pending && s_antenna_boot_phase != 0) {
@@ -2516,7 +2705,7 @@ static void try_weather_poll(void)
 /** GETTEMPM alle ROTOR_MOTOR_TEMP_POLL_MS; gleiche Stillstands-/Boot-Sperren wie Wetter. */
 static void try_motor_temp_poll(void)
 {
-    if (!s_boot_done || s_poll_pos || s_poll_ref) {
+    if (!s_boot_done || s_poll_pos || homing_active_internal()) {
         return;
     }
     if (s_antenna_boot_pending && s_antenna_boot_phase != 0) {
@@ -2540,7 +2729,12 @@ void rotor_rs485_loop(void)
         return;
     }
 
-    if (err != 10 && s_boot_test_done) {
+    /* Verbindungs-Watchdog nicht während Homing-Sequenz: Slave kann bei Referenzfahrt länger
+     * als ROTOR_CONN_LOST_TIMEOUT_MS keine ACKs senden — sonst Fehler 10, stop_fault_motion_polling()
+     * bricht Homing ab (Ring stoppt, „Nicht referenziert“ obwohl der Bus danach wieder ok ist).
+     * s_poll_ref || s_request_pos_after_homing gilt auch kurz nach SETREF, solange der Slave noch
+     * GETREF=1 meldet (s_slave_referenced true), bis das erste „nicht referenziert“ verarbeitet ist. */
+    if (err != 10 && s_boot_test_done && !(s_poll_ref || s_request_pos_after_homing)) {
         const uint32_t now = millis();
         uint32_t conn_timeout_ms = ROTOR_CONN_LOST_TIMEOUT_MS;
         if (s_pending == Pending::SetPosDg) {
@@ -2557,6 +2751,7 @@ void rotor_rs485_loop(void)
         }
         if (conn_timeout) {
             clear_pending();
+            s_err10_recovery_getref_pending = false;
             rotor_error_app_set_error_code(10);
             stop_fault_motion_polling();
             s_foreign_master_src_id = 0;
@@ -2573,7 +2768,45 @@ void rotor_rs485_loop(void)
      * Vorschau-Telegramm beim Encoder während Positionsfahrt oder direkt danach. */
     try_flush_setposcc();
 
+    if (rotor_rs485_is_foreign_pc_listen_mode() && s_pending != Pending::None) {
+        /* Proxy aktiv: lokale Hintergrund-Requests nicht weiter blockieren lassen. */
+        switch (s_pending) {
+        case Pending::GetAnemo:
+        case Pending::GetTempA:
+        case Pending::GetWindDir:
+        case Pending::GetTempM:
+        case Pending::GetErr:
+        case Pending::GetAntOff1:
+        case Pending::GetAntOff2:
+        case Pending::GetAntOff3:
+        case Pending::GetAngle1:
+        case Pending::GetAngle2:
+        case Pending::GetAngle3:
+        case Pending::GetRef:
+        case Pending::GetPosDg:
+            clear_pending();
+            break;
+        default:
+            break;
+        }
+    }
+
     if (s_pending != Pending::None) {
+        return;
+    }
+
+    if (rotor_rs485_is_foreign_pc_listen_mode()) {
+        /* Eigenes TEST-BOOT laeuft nicht (return vor try_boot_test). Sobald der Slave am Bus
+         * antwortet (Fremd-Master pollt), ist der Link real — Startup-GETERR-Pfad ueberspringen,
+         * sonst bleiben Meldetext „Initialisiere“ und homing_led rot trotz gruenem Ring (Ref aus ACK). */
+        if (!s_startup_err_known) {
+            if (s_boot_test_done) {
+                s_startup_err_known = true;
+            } else if (s_have_slave_rx_ever) {
+                s_boot_test_done = true;
+                s_startup_err_known = true;
+            }
+        }
         return;
     }
 
@@ -2583,8 +2816,13 @@ void rotor_rs485_loop(void)
         return;
     }
 
-    /* Fehler 10: keine zyklischen GETERR-Abfragen mehr; Aufhebung bei eingehender Slave-Antwort im Parser. */
+    /* Fehler 10: periodisch GETREF (Intervall ROTOR_CONN_RECOVERY_GETREF_MS via pending_timed_out), bis der
+     * Slave wieder antwortet; Parser hebt Fehler 10 bei erster gültiger Slave-Zeile auf. */
     if (rotor_error_app_get_error_code() == 10) {
+        if (s_pending == Pending::None) {
+            s_err10_recovery_getref_pending = true;
+            send_request("GETREF", "0", Pending::GetRef);
+        }
         return;
     }
 
@@ -2592,14 +2830,12 @@ void rotor_rs485_loop(void)
         return;
     }
 
-    if (rotor_rs485_is_foreign_pc_listen_mode()) {
-        if (s_boot_test_done && !s_startup_err_known) {
-            s_startup_err_known = true;
+    if (homing_active_internal()) {
+        s_poll_ref = true;
+        if ((int32_t)(millis() - s_next_ref_poll_ms) >= 0) {
+            send_request("GETREF", "0", Pending::GetRef);
         }
-        /* Ohne Ausnahme: kein eigenes GETPOSDG bei lokaler Fahrt → Ist nur über fremde Master-ACKs, wirkt wie Nachlaufen. */
-        if (!s_poll_pos && !s_poll_ref) {
-            return;
-        }
+        return;
     }
 
     try_boot_startup_geterr();
@@ -2622,18 +2858,11 @@ void rotor_rs485_loop(void)
 
     if (s_poll_pos) {
         if (rotor_rs485_is_foreign_pc_listen_mode()) {
-            /* Fremd-PC pollt bereits GETPOSDG: keine eigene Zusatzlast senden. */
+            /* Fremd-PC pollt GETPOSDG: keine eigene Zusatzlast senden. */
             return;
         }
         if ((int32_t)(millis() - s_next_pos_poll_ms) >= 0) {
             send_request("GETPOSDG", "0", Pending::GetPosDg);
-        }
-        return;
-    }
-
-    if (s_poll_ref) {
-        if ((int32_t)(millis() - s_next_ref_poll_ms) >= 0) {
-            send_request("GETREF", "0", Pending::GetRef);
         }
         return;
     }
