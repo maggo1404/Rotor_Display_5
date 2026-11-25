@@ -3,20 +3,25 @@
 .SYNOPSIS
   Firmware flashen; optional LittleFS (Bilder) mit hochladen.
   Zu Beginn: alle *.bin unter src\ui loeschen (EEZ-Exportreste).
+  Nach dem Build: Ordner IMGs\ neu befuellen (ESP Web Tools / espwebtool).
 
 .PARAMETER Clean
   Führt zuerst pio run -t clean aus.
 
 .PARAMETER WithFs
   PNGs nach data/img konvertieren und LittleFS (uploadfs) hochladen, danach Firmware.
+  Zusaetzlich fatfs.bin in IMGs\ ablegen (Offset 0x610000).
 
 .PARAMETER Version
   Neue Versionsnummer setzen (z. B. "1.1") — schreibt include\firmware_version.h (APP_VERSION, APP_DATE).
   Ohne Angabe bleibt die Version unverändert (wie RotorTcpBridge/build.ps1).
 
+.PARAMETER SkipUpload
+  Nur bauen und IMGs aktualisieren, kein Upload auf den Controller.
+
 .EXAMPLE
   .\build.ps1
-  Nur Firmware: pio run -t upload -e esp32-s3-viewe
+  Build, IMGs aktualisieren, Firmware flashen.
 
 .EXAMPLE
   .\build.ps1 -Version "1.1"
@@ -28,6 +33,10 @@
   PNG -> .bin, uploadfs, dann Firmware-Upload.
 
 .EXAMPLE
+  .\build.ps1 -SkipUpload
+  Nur Build + IMGs (fuer espwebtool), kein COM-Upload.
+
+.EXAMPLE
   .\build.ps1 --clean --fs
 #>
 [CmdletBinding()]
@@ -37,6 +46,8 @@ param(
     [Parameter(Mandatory = $false)]
     [Alias('Fs')]
     [switch]$WithFs,
+    [Parameter(Mandatory = $false)]
+    [switch]$SkipUpload,
     [Parameter(Mandatory = $false)]
     [string]$Version = '',
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -104,6 +115,8 @@ foreach ($a in $RemainingArguments) {
         '^--fs$' { $WithFs = $true }
         '^--with-fs$' { $WithFs = $true }
         '^--mit-fs$' { $WithFs = $true }
+        '^--?skip-?upload$' { $SkipUpload = $true }
+        '^--?no-?upload$' { $SkipUpload = $true }
     }
 }
 
@@ -116,6 +129,131 @@ function Invoke-Step {
     }
 }
 
+# IMGs\ fuer ESP Web Tools: zwei getrennte Pakete
+#   IMGs\update\         - Firmware-Update ohne Dateisystem (Einstellungen/Bilder bleiben)
+#   IMGs\full-install\   - Komplett-Installation inkl. fatfs.bin (Bilder + Default-Config)
+function Update-WebFlasherImgs {
+    param(
+        [string]$BuildDir,
+        [string]$ImgsDir,
+        [string]$FwVersion,
+        [bool]$IncludeFatfs
+    )
+
+    if (-not (Test-Path -LiteralPath $BuildDir)) {
+        throw "Build-Verzeichnis fehlt: $BuildDir"
+    }
+
+    if (Test-Path -LiteralPath $ImgsDir) {
+        Remove-Item -LiteralPath $ImgsDir -Recurse -Force
+    }
+    $updateDir = Join-Path $ImgsDir 'update'
+    $fullDir = Join-Path $ImgsDir 'full-install'
+    New-Item -ItemType Directory -Path $updateDir -Force | Out-Null
+    New-Item -ItemType Directory -Path $fullDir -Force | Out-Null
+
+    $binNames = @('bootloader.bin', 'partitions.bin', 'firmware.bin')
+    foreach ($name in $binNames) {
+        $src = Join-Path $BuildDir $name
+        if (-not (Test-Path -LiteralPath $src)) {
+            throw "Fehlt nach Build: $src"
+        }
+        Copy-Item -LiteralPath $src -Destination (Join-Path $updateDir $name) -Force
+        Copy-Item -LiteralPath $src -Destination (Join-Path $fullDir $name) -Force
+        Write-Host "  IMGs\...\$name" -ForegroundColor DarkGray
+    }
+
+    $partCsv = Join-Path $PSScriptRoot 'partitions.csv'
+    if (Test-Path -LiteralPath $partCsv) {
+        Copy-Item -LiteralPath $partCsv -Destination (Join-Path $updateDir 'partitions.csv') -Force
+        Copy-Item -LiteralPath $partCsv -Destination (Join-Path $fullDir 'partitions.csv') -Force
+        Write-Host '  IMGs\...\partitions.csv' -ForegroundColor DarkGray
+    }
+
+    # boot_app0 (OTA-Daten) - Standard Arduino-ESP32, Offset 0xE000
+    $bootApp0Candidates = [System.Collections.Generic.List[string]]::new()
+    $bootApp0Candidates.Add((Join-Path $BuildDir 'boot_app0.bin'))
+    if ($env:USERPROFILE) {
+        $bootApp0Candidates.Add((Join-Path $env:USERPROFILE '.platformio\packages\framework-arduinoespressif32\tools\partitions\boot_app0.bin'))
+    }
+    if ($env:HOME) {
+        $bootApp0Candidates.Add((Join-Path $env:HOME '.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin'))
+    }
+    $bootApp0Src = $bootApp0Candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    $haveBootApp0 = $false
+    if ($bootApp0Src) {
+        Copy-Item -LiteralPath $bootApp0Src -Destination (Join-Path $updateDir 'boot_app0.bin') -Force
+        Copy-Item -LiteralPath $bootApp0Src -Destination (Join-Path $fullDir 'boot_app0.bin') -Force
+        Write-Host '  IMGs\...\boot_app0.bin' -ForegroundColor DarkGray
+        $haveBootApp0 = $true
+    }
+    else {
+        Write-Host '  WARNUNG: boot_app0.bin nicht gefunden - Manifest ohne OTA-Daten.' -ForegroundColor Yellow
+    }
+
+    $baseParts = [System.Collections.Generic.List[object]]::new()
+    $baseParts.Add([ordered]@{ path = 'bootloader.bin'; offset = 0 })
+    $baseParts.Add([ordered]@{ path = 'partitions.bin'; offset = 32768 })   # 0x8000
+    if ($haveBootApp0) {
+        $baseParts.Add([ordered]@{ path = 'boot_app0.bin'; offset = 57344 }) # 0xE000
+    }
+    $baseParts.Add([ordered]@{ path = 'firmware.bin'; offset = 65536 })     # 0x10000
+
+    function New-WebFlasherManifest {
+        param([string]$Path, [string]$Name, [bool]$PromptErase, [object[]]$Parts)
+        $manifest = [ordered]@{
+            name                     = $Name
+            version                  = $FwVersion
+            new_install_prompt_erase = $PromptErase
+            builds                   = @(
+                [ordered]@{
+                    chipFamily = 'ESP32-S3'
+                    parts      = @($Parts)
+                }
+            )
+        }
+        $json = $manifest | ConvertTo-Json -Depth 6
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($Path, $json, $utf8NoBom)
+    }
+
+    # 1) Update-Paket: ohne fatfs - Einstellungen/Bilder auf dem Geraet bleiben erhalten
+    New-WebFlasherManifest -Path (Join-Path $updateDir 'manifest.json') `
+        -Name 'Rotor Display 5 (Update)' -PromptErase $false -Parts $baseParts.ToArray()
+    Write-Host "  IMGs\update\manifest.json  (v$FwVersion, ohne Dateisystem)" -ForegroundColor DarkGray
+
+    # 2) Komplett-Installation inkl. FATFS (Bilder + config.json-Vorlage)
+    if ($IncludeFatfs) {
+        $fatSrc = Join-Path $BuildDir 'fatfs.bin'
+        if (-not (Test-Path -LiteralPath $fatSrc)) {
+            Write-Host '  fatfs.bin fehlt - baue Filesystem-Image ...' -ForegroundColor DarkGray
+            & $pioExe run -t buildfs -e esp32-s3-viewe
+            if ($LASTEXITCODE -ne 0) {
+                throw "buildfs fehlgeschlagen (Exit $LASTEXITCODE)"
+            }
+        }
+        if (Test-Path -LiteralPath $fatSrc) {
+            Copy-Item -LiteralPath $fatSrc -Destination (Join-Path $fullDir 'fatfs.bin') -Force
+            Write-Host '  IMGs\full-install\fatfs.bin' -ForegroundColor DarkGray
+
+            $fullParts = [System.Collections.Generic.List[object]]::new($baseParts)
+            # pioarduino/Arduino-ESP32 3.x: buildfs liefert ein WL-gewrapptes Image
+            # [dummy:4096][FAT][state…] — gehoert an den Partitionanfang 0x610000 (nicht +4096).
+            $fullParts.Add([ordered]@{ path = 'fatfs.bin'; offset = 6356992 }) # 0x610000
+            New-WebFlasherManifest -Path (Join-Path $fullDir 'manifest.json') `
+                -Name 'Rotor Display 5 (Komplett-Installation)' -PromptErase $true -Parts $fullParts.ToArray()
+            Write-Host "  IMGs\full-install\manifest.json  (v$FwVersion, inkl. Dateisystem)" -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host '  WARNUNG: fatfs.bin nicht erzeugt - nur Update-Paket vorhanden.' -ForegroundColor Yellow
+            Remove-Item -LiteralPath $fullDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    else {
+        Remove-Item -LiteralPath $fullDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 try {
     if ($Clean) {
         Invoke-Step "pio clean" { & $pioExe run -t clean }
@@ -123,10 +261,29 @@ try {
 
     if ($WithFs) {
         Invoke-Step "PNG -> LVGL .bin" { python tools/png_to_lvgl8_bin.py }
-        Invoke-Step "uploadfs (LittleFS)" { & $pioExe run -t uploadfs }
     }
 
-    Invoke-Step "upload Firmware (esp32-s3-viewe)" { & $pioExe run -t upload -e esp32-s3-viewe }
+    Invoke-Step "pio build (esp32-s3-viewe)" { & $pioExe run -e esp32-s3-viewe }
+
+    $buildDir = Join-Path $PSScriptRoot '.pio\build\esp32-s3-viewe'
+    $imgsDir = Join-Path $PSScriptRoot 'IMGs'
+    Invoke-Step "IMGs aktualisieren (ESP Web Tools)" {
+        # Dateisystem (fatfs.bin) gehoert immer ins Web-Flasher-Paket, sonst fehlen einem frisch
+        # geflashten Geraet die Bilder (Kompass-Hintergrund, Windpfeil) aus data/img. -WithFs steuert
+        # hier nur noch die PNG->bin-Neukonvertierung; das Einpacken passiert unabhaengig davon.
+        Update-WebFlasherImgs -BuildDir $buildDir -ImgsDir $imgsDir -FwVersion $Version -IncludeFatfs $true
+    }
+
+    if ($WithFs -and -not $SkipUpload) {
+        Invoke-Step "uploadfs (FATFS)" { & $pioExe run -t uploadfs -e esp32-s3-viewe }
+    }
+
+    if (-not $SkipUpload) {
+        Invoke-Step "upload Firmware (esp32-s3-viewe)" { & $pioExe run -t upload -e esp32-s3-viewe }
+    }
+    else {
+        Write-Host "`nUpload uebersprungen (-SkipUpload). IMGs liegt unter: $imgsDir" -ForegroundColor Yellow
+    }
 
     Write-Host "`nFertig." -ForegroundColor Green
 }

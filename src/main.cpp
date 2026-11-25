@@ -20,19 +20,19 @@
 #include "touch_feedback.h"
 #include "firmware_version.h"
 
-/** Signals → ATtiny: nur TX, wie im SignalsDemo (Serial1). */
-static constexpr int8_t SIGNALS_TX_PIN = 40;
-static constexpr int8_t SIGNALS_RX_PIN = -1;
-static constexpr uint32_t SIGNALS_BAUD = 115200;
-/** NeoPixel-Ring am Empfänger (wie SignalsDemo: 16 LEDs). */
+/** NeoPixel-Ring GPIO39, Lautsprecher PWM GPIO40 (direkt, ohne ATtiny). */
+static constexpr int8_t NEOPIXEL_PIN = 39;
+static constexpr int8_t SPEAKER_PIN = 40;
 static constexpr uint8_t SIGNALS_NUM_LEDS = 16;
 
-static Signals g_signals(Serial1);
+static Signals g_signals;
+static volatile bool s_boot_welcome_active = false;
+static TaskHandle_t s_boot_welcome_task = nullptr;
 
 /** Kurze Boot-Melodie + einmal blaues Kreislauflicht (nur beim Start). */
 static void signals_play_boot_welcome()
 {
-    g_signals.begin(SIGNALS_TX_PIN, SIGNALS_RX_PIN, SIGNALS_BAUD);
+    g_signals.begin(SIGNALS_NUM_LEDS, NEOPIXEL_PIN, SPEAKER_PIN);
     g_signals.clear();
     g_signals.stopTone();
     delay(80);
@@ -52,21 +52,45 @@ static void signals_play_boot_welcome()
     for (size_t i = 0; i < sizeof(notes) / sizeof(notes[0]); i++) {
         g_signals.tone(notes[i].freq, 18, notes[i].ms);
         delay(notes[i].ms + 35);
+        g_signals.service();
     }
     g_signals.stopTone();
-    delay(120);
-
-    /* Einmal blau im Kreis (wie Demo-Lauflicht, nur B=255) */
+    /* Ring-App arbeitet mit AutoShow=false + explizitem show(); true verursacht sichtbares Flackern,
+     * weil einzelne setPixel-Kommandos sofort angezeigt werden. */
     g_signals.setAutoShow(false);
     g_signals.clear();
-    for (uint8_t i = 0; i < SIGNALS_NUM_LEDS; i++) {
-        g_signals.clear();
-        g_signals.setPixel(i, 0, 0, 255, pwm_config_scale_led_ring_brightness(100));
-        g_signals.show();
-        delay(95);
+    g_signals.show();
+}
+
+static void signals_boot_welcome_task(void *arg)
+{
+    (void)arg;
+    signals_play_boot_welcome();
+    s_boot_welcome_active = false;
+    s_boot_welcome_task = nullptr;
+    vTaskDelete(nullptr);
+}
+
+/** Startet Boot-Melodie/-Kreiseln ohne setup() zu blockieren (Display/UI laufen parallel an). */
+static void signals_start_boot_welcome_async()
+{
+    if (s_boot_welcome_task) {
+        return;
     }
-    g_signals.setAutoShow(true);
-    g_signals.clear();
+    s_boot_welcome_active = true;
+    BaseType_t ok = xTaskCreatePinnedToCore(signals_boot_welcome_task,
+                                            "signals_boot",
+                                            4096,
+                                            nullptr,
+                                            2,
+                                            &s_boot_welcome_task,
+                                            1);
+    if (ok != pdPASS) {
+        /* Fallback: nie ohne Boot-Sequenz starten, auch wenn Task-Erzeugung fehlschlägt. */
+        signals_play_boot_welcome();
+        s_boot_welcome_active = false;
+        s_boot_welcome_task = nullptr;
+    }
 }
 
 /**
@@ -184,8 +208,10 @@ static void SingleClickCb(void *button_handle, void *usr_data)
 {
     (void)button_handle;
     (void)usr_data;
-    /* Fehler: kein Homing/Bus — nur UI-Feedback */
-    if (rotor_error_app_is_fault_locked()) {
+    /* Jeder Fehler: kurzer Tastendruck = SETREF — quittiert den Fehler am Rotor und startet
+     * Homing (ohne Endschalter nur Quittung, siehe rotor_rs485_send_setref_homing). */
+    if (rotor_error_app_get_error_code() != 0) {
+        rotor_rs485_send_setref_homing();
         lvgl_port_lock(-1);
         LVGL_button_event((void *)(intptr_t)BUTTON_SINGLE_CLICK);
         lvgl_port_unlock();
@@ -197,15 +223,22 @@ static void SingleClickCb(void *button_handle, void *usr_data)
         lvgl_port_unlock();
         return;
     }
-    if (rotor_rs485_is_moving() || rotor_rs485_is_remote_setpos_motion()) {
-        /* Homing/GET-Polling oder Fahrt nur vom PC (kein s_poll_pos → is_moving() wäre false) */
+    if (rotor_rs485_is_homing()) {
+        /* Referenzfahrt: nur STOP — SETPOSDG ohne Referenz wuerde NAK NOREF erzeugen. */
         rotor_rs485_send_stop();
-    } else if (rotor_rs485_is_position_polling() && rotor_rs485_is_referenced()) {
-        /* Soll = Ist nur mit Referenz — ohne Ref: Homing (unten) statt sinnlosem SETPOSDG */
+    } else if (rotor_rs485_is_referenced() &&
+               (rotor_rs485_is_moving() || rotor_rs485_is_remote_setpos_motion() ||
+                rotor_rs485_is_position_polling())) {
+        /* Fahrt aktiv (eigene oder Fremd-Master): Soll = letzte Ist-Position aus laufendem GETPOSDG-Polling.
+         * Rotor haelt damit genau dort an, wo der Taster gedrueckt wurde — sauberer als hartes STOP. */
         const float snap = rotor_rs485_get_last_position_deg();
         rotor_app_snap_target_to_deg(snap);
         rotor_rs485_hw_snap_retarget_request(snap);
-    } else if (!rotor_rs485_is_referenced()) {
+    } else if (!rotor_rs485_is_referenced() && rotor_rs485_is_ref_state_known() &&
+               rotor_rs485_axis_has_endstop()) {
+        /* Referenzfahrt nur für die per Long-Press aktive Achse und erst, wenn deren
+         * Referenzstatus per GETREF bestätigt ist — sonst homt ein Klick direkt nach dem
+         * Achsenwechsel eine bereits referenzierte Achse. */
         rotor_rs485_send_setref_homing();
     }
     lvgl_port_lock(-1);
@@ -220,6 +253,13 @@ static void DoubleClickCb(void *button_handle, void *usr_data)
 static void LongPressStartCb(void *button_handle, void *usr_data) {
     (void)button_handle;
     (void)usr_data;
+    if (rotor_error_app_is_fault_locked()) {
+        lvgl_port_lock(-1);
+        LVGL_button_event((void *)(intptr_t)BUTTON_LONG_PRESS_START);
+        lvgl_port_unlock();
+        return;
+    }
+    rotor_app_toggle_axis();
     lvgl_port_lock(-1);
     LVGL_button_event((void*)(intptr_t)BUTTON_LONG_PRESS_START);
     lvgl_port_unlock();
@@ -233,18 +273,20 @@ void setup()
                   FIRMWARE_APP_VERSION,
                   FIRMWARE_APP_DATE,
                   FIRMWARE_APP_COPYRIGHT);
-    serial_bridge::begin();
 
-    /* FFat vor Signals-Boot: pwm_config (conledp u. a.) liegt auf /config.json */
+    /* Config vor UART-Bridge: sonst startet begin() mit remote_usb=0 und öffnet RS485-TX. */
     if (!FFat.begin(true, "/ffat", 10, "ffat")) {
         Serial.println("FFat mount failed — Bilder unter /ffat/img/ sind nicht erreichbar");
     } else {
         Serial.printf("FFat OK, %.1f KB free\n", FFat.freeBytes() / 1024.0f);
     }
     pwm_config_load();
+    Serial.printf("remote_usb=%u\n", (unsigned)pwm_config_get_remote_usb());
+    serial_bridge::begin();
+    serial_bridge::set_remote_usb(pwm_config_get_remote_usb() != 0u);
 
-    Serial.println("Signals boot (TX GPIO40) …");
-    signals_play_boot_welcome();
+    Serial.println("Signals boot (NeoPixel GPIO39, Speaker GPIO40) …");
+    signals_start_boot_welcome_async();
     touch_feedback_set_signals(&g_signals);
     Serial.println("Initializing board");
     // esp_log_level_set("*", ESP_LOG_NONE);
@@ -276,6 +318,8 @@ void setup()
 
     Serial.println("Initialize Button device");
     Button *btn = new Button(GPIO_BUTTON_PIN, false);
+    /* AZ↔EL: Long-Press halb so lang wie Library-Default (1500 → 750 ms). */
+    btn->setParam(BUTTON_LONG_PRESS_TIME_MS, (void *)(intptr_t)450);
     btn->attachSingleClickEventCb(&SingleClickCb, NULL);
     btn->attachDoubleClickEventCb(&DoubleClickCb, NULL);
     btn->attachLongPressStartEventCb(&LongPressStartCb, NULL);
@@ -336,5 +380,8 @@ void loop()
     rotor_rs485_loop();
     rotor_app_weather_ui_poll();
     rotor_error_app_loop(millis());
-    signals_ring_app_loop(millis());
+    g_signals.service();
+    if (!s_boot_welcome_active) {
+        signals_ring_app_loop(millis());
+    }
 }

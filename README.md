@@ -16,11 +16,34 @@ Dort sind Verbindung (seriell/TCP), Protokoll, Kompass, Karte und Schnittstellen
 
 Firmware für ESP32-S3 bauen und flashen. Bilder für LVGL liegen auf der FAT-Partition (über `uploadfs`); Quellen sind PNGs im Ordner `imgs/`.
 
+**Hardware (aktuell):** NeoPixel-Ring direkt an **GPIO 39**, Lautsprecher (PWM) an **GPIO 40**, RS485 über UART **GPIO 43/44** mit selbstschaltendem Transceiver (kein DE/RE-Pin). Lautstärke (`SETLSL`), Pieps-Frequenz (`SETCONFRQ`) und Ring-Helligkeit (`SETCONLEDP`) laufen weiter über den RS485-Bus und `config.json`.
+
 ## Version und Lizenz
 
 - **Version:** siehe `include/firmware_version.h` (ein Blickwert wie bei [RotorTcpBridge](https://github.com/DK8DE/RotorTcpBridge) `rotortcpbridge/version.py`: Name, Version, Datum, Autor).
 - **Release:** `.\build.ps1 -Version "1.1"` setzt `FIRMWARE_APP_VERSION` und `FIRMWARE_APP_DATE` in `firmware_version.h`, danach wie gewohnt Build/Upload.
 - **Lizenz:** `LICENSE.txt` (Apache-2.0, identisch zur RotorTcpBridge-Vorgabe).
+- **RS485-Abfrage:** `GETCOVERSION` liefert die Version des Display-Controllers als ACK-Antwort (siehe `Info/RotorController_RS485.md`).
+
+## ESP Web Tools (`IMGs\`)
+
+Nach jedem `.\build.ps1`-Lauf liegen unter `IMGs\` **zwei getrennte Pakete** für [ESP Web Tools](https://esphome.github.io/esp-web-tools/):
+
+| Ordner | Zweck | Dateisystem (Bilder/`config.json`) |
+|--------|-------|-------------------------------------|
+| `IMGs/update/` | **Update** eines bereits eingerichteten Geräts (`manifest.json`) | wird **nicht** mitgeflasht — Einstellungen und Bilder bleiben erhalten |
+| `IMGs/full-install/` | **Komplett-Installation** (`manifest.json` + `fatfs.bin`) | wird mitgeflasht — setzt Einstellungen auf Werkszustand zurück, `new_install_prompt_erase = true` |
+
+`fatfs.bin` wird bei Bedarf automatisch erzeugt (`pio run -t buildfs`). `-WithFs` steuert weiterhin nur die PNG→`.bin`-Neukonvertierung und den Live-`uploadfs` per USB.
+
+## GitHub Actions (automatischer Build)
+
+`.github/workflows/build-firmware.yml` baut bei jedem Push/PR auf `main` (und manuell) die Firmware über `.\build.ps1 -SkipUpload` und lädt zwei Artefakte hoch:
+
+- **`webflasher-update`** — Firmware-Update ohne Dateisystem
+- **`webflasher-full-install`** — Komplett-Installation inkl. `fatfs.bin`
+
+**Release:** Ändert sich `FIRMWARE_APP_VERSION` in `include/firmware_version.h` beim Push auf `main`, wird automatisch ein GitHub-Release `vX.Y.Z` mit beiden ZIP-Paketen erstellt. Ohne Versionswechsel nur Build + Artefakte. Manuell: „Run workflow“ mit Option *create_release*.
 
 ## EEZ Studio und Bildnamen (`imgs` vs. `src/ui`)
 

@@ -23,9 +23,15 @@ void pwm_config_set_pwm_ui_fast(uint8_t fast_0_or_1);
 /** RS485: eigene Master-ID (1…254), Default 2 */
 uint8_t pwm_config_get_master_id(void);
 void pwm_config_set_master_id(uint8_t id);
-/** RS485: Rotor-Slave-ID (1…254, nicht 255/Broadcast), Default 20 */
+/** RS485: Rotor-Slave-ID AZ (0 = Achse aus, 1…254), Default 20 — JSON rotor_id */
 uint8_t pwm_config_get_rotor_id(void);
 void pwm_config_set_rotor_id(uint8_t id);
+/** Alias: gleiche ID wie pwm_config_get_rotor_id (Azimut) */
+uint8_t pwm_config_get_rotor_az_id(void);
+void pwm_config_set_rotor_az_id(uint8_t id);
+/** RS485: Rotor-Slave-ID EL (0 = Achse aus, 1…254), Default 21 — JSON rotor_el_id */
+uint8_t pwm_config_get_rotor_el_id(void);
+void pwm_config_set_rotor_el_id(uint8_t id);
 
 void pwm_config_set_slow(uint8_t pct);
 void pwm_config_set_fast(uint8_t pct);
@@ -33,7 +39,7 @@ void pwm_config_set_fast(uint8_t pct);
 /** Antennen-UI: 1…3 */
 uint8_t pwm_config_get_last_antenna(void);
 void pwm_config_set_last_antenna(uint8_t n);
-/** Zeiger auf internen Puffer (bis nächstem load/save); idx 1…3 */
+/** Labels 1…3 (Anzeige); Quelle Rotor GETANTNAME / SETANTNAME (Boot), nicht config.json-Load. idx 1…3 */
 const char *pwm_config_get_antenna_label(int idx);
 /** idx 1…3, max. 47 Zeichen + NUL */
 void pwm_config_set_antenna_label(int idx, const char *s);
@@ -46,7 +52,39 @@ void pwm_config_set_antoff_deg(int idx, float deg);
 float pwm_config_get_opening_deg(int idx);
 void pwm_config_set_opening_deg(int idx, float deg);
 
-/** UI-Touch-Pieps (Signals/ATtiny): Frequenz Hz (200…4000), Lautstärke 0…50 */
+/** Dipol-Flag (Rotor GETANTDPn / SETANTDPn): 1 = zweite Keule ±180°, idx 1…3 — nur vom Rotor, nicht config.json */
+uint8_t pwm_config_get_antdp(int idx);
+void pwm_config_set_antdp(int idx, uint8_t v_0_or_1);
+
+/** Encoder-Variante (Rotor GETENCTYPE): 1 = Axis/Motor, 2 = Ring, 3 = Absolut-Encoder — nur vom Rotor.
+ * Fahrbereich > 360° (bis 720°) gilt für alle Typen über GETMAXDG. */
+uint8_t pwm_config_get_enc_type(void);
+void pwm_config_set_enc_type(uint8_t type_1_to_3);
+
+/**
+ * EL-Rotortyp (GETROTORTYPE an EL-Slave): 1/2/3 — nur vom Rotor, nicht config.json.
+ * Typ 2 → EL 0…90°, Typ 3 (und 1) → EL 0…180°.
+ */
+uint8_t pwm_config_get_rotor_type(void);
+void pwm_config_set_rotor_type(uint8_t type_1_to_3);
+/** Wirksamer EL-Maxwinkel in Grad (90 oder 180) laut rotor_type. */
+float pwm_config_get_el_max_deg(void);
+
+/** Max-Winkel in Grad (Rotor GETMAXDG) — Rohwert vom Bus; wirksamer Span über pwm_config_get_axis_span_deg() */
+float pwm_config_get_axis_max_deg(void);
+/**
+ * Rohwert vom Bus setzen. Werte > 1000 werden als 0,01°-Einheiten (z. B. 42000 → 420°)
+ * interpretiert, sonst als Grad (z. B. 420,00).
+ */
+void pwm_config_set_axis_max_deg_raw(float raw_from_bus);
+
+/**
+ * Wirksamer Fahrbereich in Grad: axis_max (GETMAXDG, z. B. 420 oder 720) für alle Encoder-Typen 1/2/3.
+ * Unplausibel (< 360 oder > 720) → 360.
+ */
+float pwm_config_get_axis_span_deg(void);
+
+/** UI-Touch-Pieps (Signals/Speaker GPIO40): Frequenz Hz (200…4000), Lautstärke 0…50 */
 uint16_t pwm_config_get_touch_beep_freq_hz(void);
 void pwm_config_set_touch_beep_freq_hz(uint16_t hz);
 uint8_t pwm_config_get_touch_beep_vol(void);
@@ -56,13 +94,28 @@ void pwm_config_set_touch_beep_vol(uint8_t vol);
 uint8_t pwm_config_get_anemometer(void);
 void pwm_config_set_anemometer(uint8_t on_0_or_1);
 
+/**
+ * Controller Remote USB (GETCONREMOTE/SETCONREMOTE, JSON remote_usb):
+ * 1 = kein RS485-TX zum Rotor, alles über USB zur PC-Software; 0 = normaler Bus-Betrieb.
+ * Wird von link_mode mitgeführt (PC-USB → 1, RS485/WEB → 0).
+ */
+uint8_t pwm_config_get_remote_usb(void);
+void pwm_config_set_remote_usb(uint8_t on_0_or_1);
+
+/**
+ * Link-Modus (GETLINKMODE/SETLINKMODE, JSON link_mode):
+ * 0 = RS485 (Bus-Master), 1 = PC-USB (Remote USB / Desktop-Proxy), 2 = WEB (Browser Web Serial + RS485-Brücke).
+ */
+uint8_t pwm_config_get_link_mode(void);
+void pwm_config_set_link_mode(uint8_t mode_0_to_2);
+
 /** Encoder-Schritt in Zehntelgrad: 1 = 0,1°/Raste, 10 = 1°/Raste (GETCONDELTA/SETCONDELTA) */
 uint8_t pwm_config_get_encoder_delta_tenths(void);
 void pwm_config_set_encoder_delta_tenths(uint8_t tenths_1_or_10);
 
 /**
- * Antennenwechsel (GETCONCHA/SETCONCHA, JSON concha): 1 = Anzeige-Soll (taget) beibehalten, SETPOS für neue
- * Geometrie; 0 = taget auf aktuelle Ist-Anzeige (Kompass) setzen, kein zusätzliches SETPOS.
+ * Antennenwechsel (GETCONCHA/SETCONCHA, JSON concha): historisch 1 = Soll behalten + SETPOS;
+ * Anzeige zieht Ist und Soll beim Wechsel immer gleich (neuer Versatz). Flag bleibt für Bus/JSON.
  */
 uint8_t pwm_config_get_concha(void);
 void pwm_config_set_concha(uint8_t zero_or_one);

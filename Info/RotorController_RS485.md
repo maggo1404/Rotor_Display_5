@@ -1,13 +1,14 @@
 # Rotor‑Controller – RS485‑Anleitung & Firmware‑Dokumentation (DE)
 
-Stand: 2026-04-16 • Fokus: RS485‑Befehle, Einstellungen (INO), Kalibrierung/Statistik, Fehler & Warnungen. Die **Befehlstabelle** ist mit dem RotorTcpBridge‑Katalog abgeglichen (`command_catalog.py` / Befehlsfenster). Diese Datei ist mit `RotorTcpBridge/Protokoll/RotorController_RS485.html` abgestimmt.
+Stand: 2026-08-03 • Fokus: RS485‑Befehle, Einstellungen (INO), Kalibrierung/Statistik, Fehler & Warnungen. Die **Befehlstabelle** ist mit dem RotorTcpBridge‑Katalog abgeglichen (`command_catalog.py` / Befehlsfenster). Diese Datei ist mit `Info/RotorController_RS485.html` abgestimmt.
 
 ## Inhaltsverzeichnis {#toc}
 
 - [1. RS485‑Protokoll (Format, Dezimal, Checksumme)](#protocol)
-- [2. Encoder‑Varianten (fest in der Firmware)](#encoders)
+- [2. Encoder‑Varianten (Typ 1/2/3)](#encoders)
 - [3. RS485‑Befehle – Tabelle](#cmd-table)
 - [Hardwarecontroller Configuration (Display‑Controller)](#hw-controller-config)
+- [Controller Remote USB](#controller-remote-usb)
 - [4. RS485‑Befehle – Erklärung & Empfehlungen](#cmd-details)
 - [5. INO‑Konfig‑Variablen – Tabelle](#vars-table)
 - [6. INO‑Variablen – Erklärung & gute Werte](#vars-details)
@@ -87,7 +88,7 @@ Antwort: `1` bedeutet „angenommen“. Letzter Zahlenwert ist `1` → `CS = 20 
 
 ### Asynchrone Meldungen (ERR)
 
-Wenn ein **Fehler** auftritt (z.B. Blockade, Not‑Stop, Stall), stoppt der Motor und der Slave sendet ein `ERR`‑Telegramm asynchron. Neuer Standard ist Broadcast (DST=255):
+Wenn ein **Fehler** auftritt (z.B. Blockade, Not‑Stop, Stall), stoppt der Motor und der Slave sendet ein `ERR`‑Telegramm asynchron. Neuer Standard ist Broadcast (DST=255), das die Rotor‑Firmware zur Robustheit gegen Kollisionen **bis zu 3× hintereinander** sendet (Client-seitig deduplizieren: gleicher Code mehrfach ist normal, kein neuer Fehler):
 
 ```
 #20:255:ERR:16:291$
@@ -103,19 +104,29 @@ Im Beispiel ist der Fehlercode `16`. Die Checksumme ist `20 + 255 + 16 = 291`. D
 
 ## 2. Encoder‑Varianten {#encoders}
 
-Es gibt zwei Hardware‑Varianten, wie der Encoder montiert ist. Die Auswahl ist über RS485 möglich über **SETENCTYPE 1/2**. Axis hat die Id1 und Ring hat Id2.
-Bei einem Encoder‑Wechsel müss einige andere Werte angepasst werden.
+Es gibt **drei** Hardware‑/Software‑Varianten. Die Auswahl ist über RS485 mit **SETENCTYPE 1/2/3** möglich (lesen: **GETENCTYPE**).
 
-- **Ring‑Encoder an der Ausgangswelle**: typisch ca. **160000 Counts pro 360°**. Sehr feine Positionsauflösung, da direkt an der Rotor‑Achse gemessen wird.
-- **Encoder an der Motorachse**: typisch ca. **50000 Counts pro 360°** (am Motor). Mechanisch oft einfacher, aber das Getriebe kann beim Richtungswechsel Spiel haben.
+| Typ | Bedeutung | Fahrbereich (`GETMAXDG`) | Counts |
+| --- | --- | --- | --- |
+| **1** | Encoder an der **Motorachse** (Axis) | typisch **360°** | typ. ca. **50000** Counts pro 360° (Motor) |
+| **2** | **Ring‑Encoder** an der Ausgangswelle | typisch **360°** | typ. ca. **160000** Counts pro 360° |
+| **3** | Erweiterter Ring‑Encoder | typisch **420°** (z. B. `amax` = 42000 in 0,01°) | wie Ring; Positionen **über 360°** sind gültig |
 
-**Auswirkung in der Firmware:** Homing‑Rampen, erwartete Counts pro Umdrehung sowie einige Schutz‑ und Auswertefunktionen verwenden diese feste Counts‑pro‑Umdrehung‑Annahme. Daher ändert sich das Verhalten spürbar, wenn die Encoder‑Variante gewechselt wird.
+Bei einem Encoder‑Wechsel müssen Counts (`SETENCCRI`/`SETENCCAX`) und ggf. `SETMAXDG` angepasst und Homing geprüft werden.
 
-**Getriebespiel‑Kompensation beim Motor‑Encoder:** Wenn der Encoder am Motor sitzt, wird das Getriebespiel beim Homing durch die Firmware kompensiert. Dazu wird die Referenz immer mit einer definierten Anfahr‑Richtung und einer definierten Überfahr‑/Rückzugslogik angefahren, damit der Nullpunkt trotz Spiel reproduzierbar bleibt.
+- **Typ 1 (Motorachse):** Mechanisch oft einfacher, aber das Getriebe kann beim Richtungswechsel Spiel haben.
+- **Typ 2 (Ring 360°):** Sehr feine Auflösung, Messung direkt an der Rotor‑Achse.
+- **Typ 3 (Ring bis ca. 420°):** Mechanischer Fahrweg über eine volle Umdrehung hinaus. `GETPOSDG`/`SETPOSDG` liefern bzw. akzeptieren Winkel **0…Max** (z. B. 372,04°). Der Display‑Controller fragt beim Boot `GETENCTYPE` und `GETMAXDG` ab; die Zahlenanzeige zeigt den vollen Winkel, der Kompass‑Arc bleibt 0…360 (361° → Arc‑Zeiger auf 1°). Arc‑Knauf: **grün** in der ersten Umdrehung (≤360°), **rot** darüber; bei Typ 1/2 immer rot.
+
+**Auswirkung in der Firmware:** Homing‑Rampen, erwartete Counts pro Umdrehung sowie Schutz‑ und Auswertefunktionen nutzen die Counts‑pro‑Umdrehung‑Annahme der gewählten Variante.
+
+**Getriebespiel‑Kompensation beim Motor‑Encoder (Typ 1):** Die Referenz wird mit definierter Anfahr‑Richtung und Überfahr‑/Rückzugslogik angefahren, damit der Nullpunkt trotz Spiel reproduzierbar bleibt.
+
+**Display‑Controller (Boot):** Nach `GETANTOFF*` / `GETANTDP*` / `GETANGLE*` liest der Display‑Controller `GETENCTYPE`, `GETMAXDG` und anschließend `GETANTNAME1…3` vom Rotor (auch im Mitläufer‑Modus). Antennennamen kommen **nicht** mehr aus `config.json`. Ohne gültigen Typ 3 bleibt der wirksame Anzeigebereich 360°.
 
 ## 3. RS485‑Befehle – Tabelle {#cmd-table}
 
-Spalte 1 zeigt ein Beispiel vom Master zum Slave. Spalte 2 zeigt die typische Antwort vom Slave. Spalte 3 ist eine Kurzbeschreibung. **Antennenversatz** (`SETANTOFF1..3`/`GET…`) und **Öffnungswinkel** (`SETANGLE1..3`/`GET…`) werden im Controller dauerhaft gespeichert (NVS) – dieselben Befehle stehen im Bridge‑Befehlsfenster zur Verfügung.
+Spalte 1 zeigt ein Beispiel vom Master zum Slave. Spalte 2 zeigt die typische Antwort vom Slave. Spalte 3 ist eine Kurzbeschreibung. **Antennenversatz** (`SETANTOFF1..3`/`GET…`), **Öffnungswinkel** (`SETANGLE1..3`/`GET…`), **Dipol‑Flag** (`SETANTDP1..3`/`GET…`) und **Antennennamen** (`SETANTNAME1..3`/`GET…`) werden im Rotor dauerhaft gespeichert (NVS) – dieselben Befehle stehen im Bridge‑Befehlsfenster zur Verfügung.
 
 | Master → Slave | Slave → Master | Kurzbeschreibung |
 | --- | --- | --- |
@@ -123,7 +134,7 @@ Spalte 1 zeigt ein Beispiel vom Master zum Slave. Spalte 2 zeigt die typische An
 | `#0:20:STOP:...:CS$` | `#20:0:ACK_STOP:...:<CS>$` oder: `#20:0:NAK_STOP:REASON:CS$` | **[STOP](#cmd-STOP)** Weicher Stop (normales Abbremsen). |
 | `#0:20:NSTOP:...:CS$` | `#20:0:ACK_NSTOP:...:<CS>$` oder: `#20:0:NAK_NSTOP:REASON:CS$` | **[NSTOP](#cmd-NSTOP)** Not-Stop über RS485. |
 | `#0:20:GETREF:...:CS$` | `#20:0:ACK_GETREF:...:<CS>$` oder: `#20:0:NAK_GETREF:REASON:CS$` | **[GETREF](#cmd-GETREF)** Abfragen, ob Referenz (Homing) vorhanden ist. |
-| `#0:20:GETPOSDG:...:CS$` | `#20:0:ACK_GETPOSDG:...:<CS>$` oder: `#20:0:NAK_GETPOSDG:REASON:CS$` | **[GETPOSDG](#cmd-GETPOSDG)** Aktuelle Position in Grad (0,01°). |
+| `#0:20:GETPOSDG:...:CS$` | `#20:0:ACK_GETPOSDG:...:<CS>$` oder: `#20:0:NAK_GETPOSDG:REASON:CS$` | **[GETPOSDG](#cmd-GETPOSDG)** Aktuelle Position in Grad (0,01°); bei Encoder‑Typ 3 bis `GETMAXDG` (z. B. 420°). |
 | `#0:20:GETIS:...:CS$` | `#20:0:ACK_GETIS:...:<CS>$` oder: `#20:0:NAK_GETIS:REASON:CS$` | **[GETIS](#cmd-GETIS)** Aktueller Strommesswert (mV) nach Offset-Abzug. |
 | `#0:20:GETTEMPA:...:CS$` | `#20:0:ACK_GETTEMPA:...:<CS>$` oder: `#20:0:NAK_GETTEMPA:REASON:CS$` | **[GETTEMPA](#cmd-GETTEMPA)** Umgebungstemperatur in °C. |
 | `#0:20:GETTEMPM:...:CS$` | `#20:0:ACK_GETTEMPM:...:<CS>$` oder: `#20:0:NAK_GETTEMPM:REASON:CS$` | **[GETTEMPM](#cmd-GETTEMPM)** Motortemperatur in °C. |
@@ -148,6 +159,19 @@ Spalte 1 zeigt ein Beispiel vom Master zum Slave. Spalte 2 zeigt die typische An
 | `#0:20:SETANTOFF2:45,0:20,45$` | `#20:0:ACK_SETANTOFF2:1:<CS>$` oder: `#20:0:NAK_SETANTOFF2:REASON:CS$` | **[SETANTOFF2](#cmd-SETANTOFF2)** Winkelversatz der Antenne 2 speichern. |
 | `#0:20:GETANTOFF3:1:20,01$` | `#20:0:ACK_GETANTOFF3:<WERT>:<CS>$` oder: `#20:0:NAK_GETANTOFF3:REASON:CS$` | **[GETANTOFF3](#cmd-GETANTOFF3)** Winkelversatz der Antenne 3 lesen. |
 | `#0:20:SETANTOFF3:45,0:20,45$` | `#20:0:ACK_SETANTOFF3:1:<CS>$` oder: `#20:0:NAK_SETANTOFF3:REASON:CS$` | **[SETANTOFF3](#cmd-SETANTOFF3)** Winkelversatz der Antenne 3 speichern. |
+| `#0:20:GETANTDP1:1:20,01$` | `#20:0:ACK_GETANTDP1:<0\|1>:<CS>$` oder: `#20:0:NAK_GETANTDP1:REASON:CS$` | **[GETANTDP1](#cmd-GETANTDP1)** Dipol‑Flag Antenne 1 lesen (`1` = zweite Keule ±180°). |
+| `#0:20:SETANTDP1:1:20,01$` | `#20:0:ACK_SETANTDP1:1:<CS>$` oder: `#20:0:NAK_SETANTDP1:REASON:CS$` | **[SETANTDP1](#cmd-SETANTDP1)** Dipol‑Flag Antenne 1 setzen (0/1, NVS). |
+| `#0:20:GETANTDP2:1:20,01$` | `#20:0:ACK_GETANTDP2:<0\|1>:<CS>$` oder: `#20:0:NAK_GETANTDP2:REASON:CS$` | **[GETANTDP2](#cmd-GETANTDP1)** Dipol‑Flag Antenne 2 lesen. |
+| `#0:20:SETANTDP2:1:20,01$` | `#20:0:ACK_SETANTDP2:1:<CS>$` oder: `#20:0:NAK_SETANTDP2:REASON:CS$` | **[SETANTDP2](#cmd-SETANTDP1)** Dipol‑Flag Antenne 2 setzen (0/1, NVS). |
+| `#0:20:GETANTDP3:1:20,01$` | `#20:0:ACK_GETANTDP3:<0\|1>:<CS>$` oder: `#20:0:NAK_GETANTDP3:REASON:CS$` | **[GETANTDP3](#cmd-GETANTDP1)** Dipol‑Flag Antenne 3 lesen. |
+| `#0:20:SETANTDP3:1:20,01$` | `#20:0:ACK_SETANTDP3:1:<CS>$` oder: `#20:0:NAK_SETANTDP3:REASON:CS$` | **[SETANTDP3](#cmd-SETANTDP1)** Dipol‑Flag Antenne 3 setzen (0/1, NVS). |
+| `#0:20:GETANTNAME1:0:20$` | `#20:0:ACK_GETANTNAME1:<NAME>;0:<CS>$` oder: `#20:0:NAK_GETANTNAME1:REASON:CS$` | **[GETANTNAME1](#cmd-GETANTNAME1)** Antennenname 1 lesen (NVS am Rotor; Display‑Boot). |
+| `#0:20:SETANTNAME1:KW Beam:CS$` | `#20:0:ACK_SETANTNAME1:…:<CS>$` oder: `#20:0:NAK_SETANTNAME1:REASON:CS$` | **[SETANTNAME1](#cmd-SETANTNAME1)** Antennenname 1 speichern (kein `:` im Namen). |
+| `#0:20:GETANTNAME2:0:20$` | `#20:0:ACK_GETANTNAME2:<NAME>;0:<CS>$` oder NAK | **[GETANTNAME2](#cmd-GETANTNAME1)** Antennenname 2 lesen. |
+| `#0:20:SETANTNAME2:…:CS$` | `#20:0:ACK_SETANTNAME2:…:<CS>$` oder NAK | **[SETANTNAME2](#cmd-SETANTNAME1)** Antennenname 2 speichern. |
+| `#0:20:GETANTNAME3:0:20$` | `#20:0:ACK_GETANTNAME3:<NAME>;0:<CS>$` oder NAK | **[GETANTNAME3](#cmd-GETANTNAME1)** Antennenname 3 lesen. |
+| `#0:20:SETANTNAME3:…:CS$` | `#20:0:ACK_SETANTNAME3:…:<CS>$` oder NAK | **[SETANTNAME3](#cmd-SETANTNAME1)** Antennenname 3 speichern. |
+| `#0:255:SETASELECT:2:CS$` bzw. `#0:20:SETASELECT:2:CS$` | (kein Pflicht‑ACK; Broadcast 255 oder Unicast Rotor‑ID) | **[SETASELECT](#cmd-SETASELECT)** Aktive Antenne 1…3 wählen (Display‑Controller übernimmt UI/Versatz). |
 | `#0:20:GETTEMPAW:...:CS$` | `#20:0:ACK_GETTEMPAW:...:<CS>$` oder: `#20:0:NAK_GETTEMPAW:REASON:CS$` | **[GETTEMPAW](#cmd-GETTEMPAW)** Warnschwelle Umgebungstemperatur lesen. |
 | `#0:20:GETTEMPMW:...:CS$` | `#20:0:ACK_GETTEMPMW:...:<CS>$` oder: `#20:0:NAK_GETTEMPMW:REASON:CS$` | **[GETTEMPMW](#cmd-GETTEMPMW)** Warnschwelle Motortemperatur lesen. |
 | `#0:20:SETTEMPA:...:CS$` | `#20:0:ACK_SETTEMPA:...:<CS>$` oder: `#20:0:NAK_SETTEMPA:REASON:CS$` | **[SETTEMPA](#cmd-SETTEMPA)** Warnschwelle Umgebungstemperatur setzen. |
@@ -190,14 +214,14 @@ Spalte 1 zeigt ein Beispiel vom Master zum Slave. Spalte 2 zeigt die typische An
 | `#0:20:GETERR:...:CS$` optional, nicht mehr für zyklisches Polling empfohlen | `#20:0:ACK_ERR:0:<CS>$` oder: `#20:0:NAK_GETERR:REASON:CS$` | **[GETERR](#cmd-GETERR)** Aktuellen Fehlercode manuell abfragen (Fehlerfluss läuft primär über asynchrones `ERR`). |
 | `#0:20:SETREF:...:CS$` | `#20:0:ACK_SETREF:...:<CS>$` oder: `#20:0:NAK_SETREF:REASON:CS$` | **[SETREF](#cmd-SETREF)** Homing starten und Fehler quittieren. |
 | `#0:20:JOG:...:CS$` | `#20:0:ACK_JOG:...:<CS>$` oder: `#20:0:NAK_JOG:REASON:CS$` | **[JOG](#cmd-JOG)** Manuelles Verfahren (aktuell deaktiviert). |
-| `#0:20:SETPOSDG:...:CS$` | `#20:0:ACK_SETPOSDG:...:<CS>$` oder: `#20:0:NAK_SETPOSDG:REASON:CS$` | **[SETPOSDG](#cmd-SETPOSDG)** Positionsfahrt in Grad starten. |
-| `#<SRC>:<rotor_id>:SETPOSCC:<deg>;<rotor_id>:CS$` | (kein Slave-Pflicht-ACK; optional NAK je nach Gerät) | **[SETPOSCC](#cmd-SETPOSCC)** Encoder-Vorschau-Soll (Display-Controller): `DST` = eingestellte Rotor-Slave-ID (wie `SETPOSDG`), Payload `<deg>;<rotor_id>` (typisch gleiche ID), kein Fahrauftrag. RS485 und USB (Monitor) — Clients filtern nach `DST` bzw. Payload-Teil 2. |
+| `#0:20:SETPOSDG:...:CS$` | `#20:0:ACK_SETPOSDG:...:<CS>$` oder: `#20:0:NAK_SETPOSDG:REASON:CS$` | **[SETPOSDG](#cmd-SETPOSDG)** Positionsfahrt in Grad starten (bei Typ 3 bis Max‑Winkel, z. B. 420°). |
+| `#<SRC>:<rotor_id>:SETPOSCC:<deg>;<rotor_id>:CS$` | (kein Slave-Pflicht-ACK; optional NAK je nach Gerät) | **[SETPOSCC](#cmd-SETPOSCC)** Vorschau-Soll (Display): Encoder‑Schritt und Arc‑Touch (ca. alle 100 ms); Payload `<deg>;<rotor_id>`, kein Fahrauftrag. |
 | `#0:20:GETID:...:CS$` | `#20:0:ACK_GETID:...:<CS>$` oder: `#20:0:NAK_GETID:REASON:CS$` | **[GETID](#cmd-GETID)** Slave-ID lesen. |
 | `#0:20:SETID:...:CS$` | `#20:0:ACK_SETID:...:<CS>$` oder: `#20:0:NAK_SETID:REASON:CS$` | **[SETID](#cmd-SETID)** Slave-ID setzen und speichern. |
 | `#0:20:GETBEGINDG:...:CS$` | `#20:0:ACK_GETBEGINDG:...:<CS>$` oder: `#20:0:NAK_GETBEGINDG:REASON:CS$` | **[GETBEGINDG](#cmd-GETBEGINDG)** Min-Winkel (Achsenanfang) lesen. |
 | `#0:20:SETBEGINDG:...:CS$` | `#20:0:ACK_SETBEGINDG:...:<CS>$` oder: `#20:0:NAK_SETBEGINDG:REASON:CS$` | **[SETBEGINDG](#cmd-SETBEGINDG)** Min-Winkel setzen. |
-| `#0:20:GETMAXDG:...:CS$` | `#20:0:ACK_GETMAXDG:...:<CS>$` oder: `#20:0:NAK_GETMAXDG:REASON:CS$` | **[GETMAXDG](#cmd-GETMAXDG)** Max-Winkel lesen. |
-| `#0:20:SETMAXDG:...:CS$` | `#20:0:ACK_SETMAXDG:...:<CS>$` oder: `#20:0:NAK_SETMAXDG:REASON:CS$` | **[SETMAXDG](#cmd-SETMAXDG)** Max-Winkel setzen. |
+| `#0:20:GETMAXDG:...:CS$` | `#20:0:ACK_GETMAXDG:...:<CS>$` oder: `#20:0:NAK_GETMAXDG:REASON:CS$` | **[GETMAXDG](#cmd-GETMAXDG)** Max-Winkel lesen (0,01°; Typ 3 typ. 42000 = 420°). |
+| `#0:20:SETMAXDG:...:CS$` | `#20:0:ACK_SETMAXDG:...:<CS>$` oder: `#20:0:NAK_SETMAXDG:REASON:CS$` | **[SETMAXDG](#cmd-SETMAXDG)** Max-Winkel setzen (typ. 360,00 bzw. 420,00 bei Typ 3). |
 | `#0:20:GETDGOFFSET:...:CS$` | `#20:0:ACK_GETDGOFFSET:...:<CS>$` oder: `#20:0:NAK_GETDGOFFSET:REASON:CS$` | **[GETDGOFFSET](#cmd-GETDGOFFSET)** Offset (Grad) lesen. |
 | `#0:20:SETDGOFFSET:...:CS$` | `#20:0:ACK_SETDGOFFSET:...:<CS>$` oder: `#20:0:NAK_SETDGOFFSET:REASON:CS$` | **[SETDGOFFSET](#cmd-SETDGOFFSET)** Offset setzen (Grad). |
 | `#0:20:GETHOMEPWM:...:CS$` | `#20:0:ACK_GETHOMEPWM:...:<CS>$` oder: `#20:0:NAK_GETHOMEPWM:REASON:CS$` | **[GETHOMEPWM](#cmd-GETHOMEPWM)** Homing-Max-PWM (%) lesen. |
@@ -251,8 +275,8 @@ Spalte 1 zeigt ein Beispiel vom Master zum Slave. Spalte 2 zeigt die typische An
 | `#0:20:SETENCCRI:...:CS$` | `#20:0:ACK_SETENCCRI:...:<CS>$` oder: `#20:0:NAK_SETENCCRI:REASON:CS$` | **[SETENCCRI](#cmd-SETENCCRI)** Counts pro 360° Ring-Encoder setzen (typ. ~160000). |
 | `#0:20:GETENCCAX:...:CS$` | `#20:0:ACK_GETENCCAX:...:<CS>$` oder: `#20:0:NAK_GETENCCAX:REASON:CS$` | **[GETENCCAX](#cmd-GETENCCAX)** Counts pro 360° **Motor-/Achsen**-Encoder lesen. |
 | `#0:20:SETENCCAX:...:CS$` | `#20:0:ACK_SETENCCAX:...:<CS>$` oder: `#20:0:NAK_SETENCCAX:REASON:CS$` | **[SETENCCAX](#cmd-SETENCCAX)** Counts pro 360° Motor-/Achsen-Encoder setzen (typ. ~28600…50000). |
-| `#0:20:GETENCTYPE:...:CS$` | `#20:0:ACK_GETENCTYPE:...:<CS>$` oder: `#20:0:NAK_GETENCTYPE:REASON:CS$` | **[GETENCTYPE](#cmd-GETENCTYPE)** Encoder-Variante lesen: 1 = Achse/Motor, 2 = Ring. |
-| `#0:20:SETENCTYPE:...:CS$` | `#20:0:ACK_SETENCTYPE:...:<CS>$` oder: `#20:0:NAK_SETENCTYPE:REASON:CS$` | **[SETENCTYPE](#cmd-SETENCTYPE)** Encoder-Variante setzen (1 oder 2). Nach Wechsel Homing/Counts prüfen. |
+| `#0:20:GETENCTYPE:...:CS$` | `#20:0:ACK_GETENCTYPE:...:<CS>$` oder: `#20:0:NAK_GETENCTYPE:REASON:CS$` | **[GETENCTYPE](#cmd-GETENCTYPE)** Encoder-Variante lesen: 1 = Achse/Motor, 2 = Ring 360°, 3 = Ring erweitert (z. B. 420°). |
+| `#0:20:SETENCTYPE:...:CS$` | `#20:0:ACK_SETENCTYPE:...:<CS>$` oder: `#20:0:NAK_SETENCTYPE:REASON:CS$` | **[SETENCTYPE](#cmd-SETENCTYPE)** Encoder-Variante setzen (1…3). Nach Wechsel Homing/Counts/`GETMAXDG` prüfen. |
 
 [↑ Inhaltsverzeichnis](#toc)
 
@@ -270,26 +294,47 @@ Schreibbefehle speichern in `config.json` (Slow/Fast‑PWM, IDs, Antennen‑Labe
 
 | Befehl | Antwort |
 | --- | --- |
-| `GETCONRID` / `GETTCONRID` (Alias) | `ACK_GETCONRID` (Parameter = aktuelle `rotor_id`) |
-| `SETCONRID` | `ACK_SETCONRID` / `NAK_SETCONRID` (Rotor‑Slave‑ID 1…254) |
+| `GETCOVERSION` | `ACK_GETCOVERSION` / `NAK_GETCOVERSION` — Firmware‑Version des Display‑Controllers (`FIRMWARE_APP_VERSION`, z. B. `1.3.0`), für eine stabile CS mit `;0` angehängt (analog `GETCONANTNAME*`). |
+| `GETCONTAZID` | `ACK_GETCONTAZID` (Parameter = aktuelle `rotor_id` / AZ‑Slave‑ID, **0…254**; `0` = Achse aus). Beispiel: `#1:2:GETCONTAZID:0:3$` → `#2:1:ACK_GETCONTAZID:20:…$`. |
+| `SETCONTAZID` | `ACK_SETCONTAZID` / `NAK_SETCONTAZID` — AZ‑Rotor‑Slave‑ID **0…254** setzen und speichern (`0` = Achse aus). Sofort übernommen (aktive Achse ggf. auf EL). Beispiel: `#1:2:SETCONTAZID:22:25$` (`CS = 1 + 2 + 22`). |
+| `GETCONTELID` | `ACK_GETCONTELID` (Parameter = aktuelle `rotor_el_id` / EL‑Slave‑ID, **0…254**; `0` = Achse aus). |
+| `SETCONTELID` | `ACK_SETCONTELID` / `NAK_SETCONTELID` — EL‑Rotor‑Slave‑ID **0…254** setzen und speichern (`0` = Achse aus). Sofort übernommen (aktive Achse ggf. auf AZ). Beispiel: `#1:2:SETCONTELID:21:24$` (`CS = 1 + 2 + 21`). |
 | `GETCONTID` | `ACK_GETCONTID` (Parameter = `master_id` des Controllers) |
 | `SETCONTID` | `ACK_SETCONTID` / `NAK_SETCONTID` (1…254) — Ziel `DST = master_id` (unicast). |
 | `SETCONIDF` oder `SETCONTID` mit `DST = 255` (Broadcast) | `ACK_SETCONIDF` bzw. `ACK_SETCONTID` / `NAK_SETCONTID` — setzt die **neue** Controller‑`master_id` in `config.json`, wenn die bisherige ID unbekannt ist. Checksumme: `CS = SRC + 255 + <neue ID>` (z. B. `#1:255:SETCONIDF:5:261$` mit `1+255+5=261`). |
-| `GETCONANTNAME1` … `GETCONANTNAME3` | `ACK_GETCONANTNAME1` … / `NAK_GETCONANTNAME*` — Antworttext enthält den Namen, für eine stabile CS wird `;0` angehängt (letzter Zahlenwert 0). |
-| `SETCONANTNAME1` … `SETCONANTNAME3` | `ACK_SETCONANTNAME1` … / `NAK_SETCONANTNAME*` — ein `:` im Namen ist unzulässig (`NAK` mit Code 1). |
+| `GETCONANTNAME1` … `GETCONANTNAME3` | `ACK_GETCONANTNAME1` … / `NAK_GETCONANTNAME*` — liefert den **aktuell am Controller gecachten** Namen (nach Boot = Rotor `GETANTNAME*`); ACK mit `;0` für stabile CS. |
+| `SETCONANTNAME1` … `SETCONANTNAME3` | `ACK_SETCONANTNAME1` … / `NAK_SETCONANTNAME*` — speichert lokal und sendet zusätzlich `SETANTNAME*` an den Rotor; `:` im Namen unzulässig (`NAK` Code 1). |
 | `GETCONSPWM` / `SETCONSPWM` | `ACK_GETCONSPWM` / `ACK_SETCONSPWM` (bzw. `NAK_SETCONSPWM`) — Slow‑PWM in % (0…100), entspricht `slow_pwm` in der JSON. |
 | `GETCONFPWM` / `SETCONFPWM` | `ACK_GETCONFPWM` / `ACK_SETCONFPWM` (bzw. `NAK_SETCONFPWM`) — Fast‑PWM in % (0…100), entspricht `fast_pwm`. |
 | `GETCONFRQ` / `SETCONFRQ` | `ACK_GETCONFRQ` / `ACK_SETCONFRQ` — Touch‑Pieps‑Frequenz in Hz (200…4000), in `config.json` als `confrq`. |
 | `GETLSL` / `SETLSL` | `ACK_GETLSL` / `ACK_SETLSL` — Touch‑Pieps‑Lautstärke 0…50 (wie `Signals::tone`), in `config.json` als `lsl`. |
 | `GETCONANO` / `SETCONANO` | `ACK_GETCONANO` / `ACK_SETCONANO` (bzw. `NAK_SETCONANO`) — Anemometer/Wetter‑Tab: `1` = Wind, Außentemperatur und Windrichtung im Wetter‑Tab; `0` = Wetter‑Tab aus, `GETTEMPA` für Außentemp (Rotor\_Info) bleibt. JSON `anemometer`. |
+| `GETCONREMOTE` / `SETCONREMOTE` | `ACK_GETCONREMOTE` / `ACK_SETCONREMOTE` (bzw. `NAK_SETCONREMOTE`) — **Controller Remote USB**: `1` = kein RS485‑TX zum Rotor (UART‑TX‑Pin hochohmig), alle Controller‑Telegramme nur über USB zur PC‑Software; `0` = normaler Bus‑Betrieb. JSON `remote_usb`. Beim Einschalten und nach längerem USB‑Link‑Verlust (~15 s ohne PC‑Byte) startet der Controller die Boot‑Kette neu (`rotor_rs485_relink`) — **nicht** bei kurzen Sendepausen. Ohne PC: Meldetext „Warten auf PC“, LED-Ring gelb (kein Soft-10/Verbindungstimeout-Wechsel). Mit PC: „Remote USB“. RS485-TX bleibt physisch stumm (UART-TX hochohmig); Bus-RX wird nicht ausgewertet. `SETCONREMOTE:1` setzt `link_mode=1` (PC-USB); `SETCONREMOTE:0` setzt `link_mode=0` (RS485), wenn zuvor PC-USB aktiv war. |
+| `GETLINKMODE` / `SETLINKMODE` | `ACK_GETLINKMODE` / `ACK_SETLINKMODE` (bzw. `NAK_SETLINKMODE`) — **Link-Modus** am Display: `0` = RS485 (Bus-Master), `1` = PC-USB (`remote_usb=1`, Desktop-Proxy), `2` = WEB (RS485-Brücke aktiv, USB-Host = Browser/Web Serial → `PcProxyMaster`). JSON `link_mode`. UI: linke Taste im Fast-Menü zyklisch RS485 → PC-USB → WEB; rechte Taste Fast/Slow. |
 | `GETCONDELTA` / `SETCONDELTA` | `ACK_GETCONDELTA` / `ACK_SETCONDELTA` (bzw. `NAK_SETCONDELTA`) — Encoder‑Schritt pro Raste: `1` oder `10` Zehntelgrad (0,1° bzw. 1° pro Klick). JSON `encoder_delta`. |
 | `GETCONCHA` / `SETCONCHA` | `ACK_GETCONCHA` / `ACK_SETCONCHA` (bzw. `NAK_SETCONCHA`) — Verhalten beim Antennenwechsel: `1` = Anzeige‑Soll (`taget`) beibehalten, `SETPOSDG` mit neuer Antennen‑Geometrie; `0` = `taget` auf die aktuelle Ist‑Anzeige (Kompass) setzen, kein zusätzliches SETPOS. JSON `concha`. |
+| `GETCONLEDP` / `SETCONLEDP` | `ACK_GETCONLEDP` / `ACK_SETCONLEDP` (bzw. `NAK_*`) — NeoPixel‑Ring global 0…100 %. JSON `conledp`. |
+| `GETASELECT` | `ACK_GETASELECT` / `NAK_GETASELECT` — aktive Antenne **1…3** am Display‑Controller lesen (`last_antenna`). Anfrage z. B. `#<PC>:<cont_id>:GETASELECT:0:<CS>$`, Antwort `#<cont_id>:<PC>:ACK_GETASELECT:<1\|2\|3>:<CS>$`. |
 
 **Pflege (Firmware):** Neue Konfig‑Befehle für den Display‑Controller bitte in `src/rotor_rs485.cpp` (`handle_local_config_command`), in `include/pwm_config.h` / `src/pwm_config.cpp` / `data/config.json` und **in dieser Tabelle** parallel ergänzen.
 
 **NAK‑Codes (typisch):** `1` = ungültiger Wertebereich oder verbotenes Zeichen im Namen; `2` = Checksumme/Format passt nicht.
 
 **GET‑Anfragen** verwenden wie üblich z. B. `PARAMS = 0` (letzter Zahlenwert für die CS‑Bildung).
+
+### Controller Remote USB {#controller-remote-usb}
+
+Wenn `SETCONREMOTE:1` aktiv ist, nimmt der Display‑Controller **keinen** eigenen RS485‑Kontakt zum Rotor mehr auf. Stattdessen:
+
+1. Der Controller sendet seine normalen Master‑Telegramme (`TEST`, `GETREF`, `GETPOSDG`, Antennen‑/Encoder‑Boot, Wetter, …) nur über **USB‑CDC**.
+2. Die PC‑Software (`RotorTcpBridge`, Einstellungen → Controller → „Controller Remote USB“) öffnet einen zweiten Link (`controller_link`, COM) und arbeitet als **transparenter Proxy**:
+   - alles vom Controller → unverändert an den Rotor‑Link (`hardware_link`, meist TCP/IP)
+   - alles vom Rotor‑Link‑RX → unverändert zurück an den Controller
+   - eigene Software‑TX nur bei Steuerbefehlen (`SETPOSDG`/`SETPOSCC`/`STOP`/`SETREF`/`SETASELECT`/…) — kein Poll‑Flood auf USB
+3. Relink (Boot‑Kette neu) nur bei erstem PC‑Kontakt bzw. nach ~15 s ohne USB‑Byte — nicht bei Idle‑Pausen unter 15 s.
+4. Ohne PC-Link (bzw. nach ~1,5 s ohne USB-Byte): Meldetext „Warten auf PC“, LED-Ring gelb — kein Soft-10 („Verbindungstimeout“ / Homing-Wechsel). Relink erst nach ~15 s Pause und erneutem PC-Kontakt.
+5. Controller‑Konfiguration (`SETCON*` / `GETCON*` / `SETLSL`) läuft über denselben USB‑Link (Ziel = `cont_id`).
+6. Profilwechsel in der Software schreibt weiterhin abweichende Achsen‑IDs (`SETCONTAZID` / `SETCONTELID`) — im Remote‑Modus über USB.
 
 [↑ Inhaltsverzeichnis](#toc)
 
@@ -345,7 +390,9 @@ Hier ist jeder Befehl in einem eigenen Absatz beschrieben: Was er macht, wie man
 
 **Was es macht:** Aktuelle Position in Grad (0,01°).
 
-**Details:** Rückgabe ist immer die Offset-korrigierte Position.
+**Details:** Rückgabe ist immer die Offset-korrigierte Position. Bei **Encoder‑Typ 3** liegt der Wert im Bereich **0…`GETMAXDG`** (z. B. bis 420,00) — Werte **über 360°** sind gültig und dürfen vom Client nicht auf 0…360 gefaltet werden.
+
+**Beispiel Typ 3:** `#20:2:ACK_GETPOSDG:372,04:394,04$`
 
 ---
 
@@ -353,7 +400,7 @@ Hier ist jeder Befehl in einem eigenen Absatz beschrieben: Was er macht, wie man
 
 **Was es macht:** Positionsfahrt in Grad starten.
 
-**Details:** Parameter: Zielwinkel (z.B. 160,00).
+**Details:** Parameter: Zielwinkel (z.B. 160,00). Bei Typ 3 auch Ziele über 360° bis zum Max‑Winkel (z. B. 400,00).
 
 **Gute Werte:** Zielwinkel in Grad, z.B. `160,00`. Bei sehr kleinen Schritten (0,01°) kann es sinnvoll sein, die Ankunftstoleranz (`ARRTOL`) etwas grösser zu wählen, damit die Regelung nicht „zittert“.
 
@@ -361,9 +408,14 @@ Hier ist jeder Befehl in einem eigenen Absatz beschrieben: Was er macht, wie man
 
 #### `SETPOSCC` {#cmd-SETPOSCC}
 
-**Was es macht:** Nur Anzeige-/Vorschau-Soll melden (Encoder am Display-Controller) — **keine** Positionsfahrt am Rotor.
+**Was es macht:** Nur Anzeige-/Vorschau-Soll melden (Display-Controller) — **keine** Positionsfahrt am Rotor.
 
-**Details:** Telegramm geht an die **Rotor-Adresse** (`DST` = Slave-ID des Rotors, wie bei `GETPOSDG`/`SETPOSDG`). Payload zweiteilig: `<deg>;<rotor_id>` (z. B. `151,30;20` — üblicherweise gleiche Zahl wie `DST`). Wird bei jedem Encoder-Schritt gesendet, sobald `taget` auf dem Display neu steht; `SETPOSDG` folgt erst nach Encoder-Ruhepause. Auf RS485 und USB (Monitor), damit alle Bus-Teilnehmer und PC-Software den gemeinten Rotor erkennen.
+**Details:** Telegramm geht an die **Rotor-Adresse** (`DST` = Slave-ID des Rotors, wie bei `GETPOSDG`/`SETPOSDG`), im Mitläufer‑Modus ggf. an die fremde Master‑ID. Payload zweiteilig: `<deg>;<rotor_id>` (z. B. `151,30;20`). Wird gesendet:
+
+- bei jedem **Encoder‑Schritt**, sobald `taget` neu steht;
+- beim **Arc‑Touch** (Ziehen) gedrosselt ca. **alle 100 ms**.
+
+`SETPOSDG` folgt erst nach Encoder‑Ruhepause bzw. beim Loslassen des Arc. Auf RS485 und USB (Monitor).
 
 **Paketbeispiele** (Master-ID 7, Rotor 20 bzw. 21; CS = SRC + DST + letzte Zahl im Payload = Rotor-ID): `#7:20:SETPOSCC:151,30;20:47$`, `#7:21:SETPOSCC:87,00;21:49$`.
 
@@ -397,7 +449,7 @@ Hier ist jeder Befehl in einem eigenen Absatz beschrieben: Was er macht, wie man
 
 **Details:** Antwort `ACK_ERR` mit einem Code oder 0.
 
-**Aktueller Betrieb:** In der aktuellen Controller-Firmware wird `GETERR` nicht mehr zyklisch gepollt. Fehler kommen asynchron als `ERR` (typisch `#<rotor_id>:255:ERR:<code>:<cs>$`) und werden direkt übernommen. `GETERR` ist damit primär für manuelle Diagnose/Service gedacht.
+**Aktueller Betrieb:** In der aktuellen Controller-Firmware wird `GETERR` nicht mehr zyklisch gepollt. Fehler kommen asynchron als `ERR` (typisch `#<rotor_id>:255:ERR:<code>:<cs>$`, vom Rotor bis zu 3× wiederholt) und werden direkt übernommen. `GETERR` ist damit primär für manuelle Diagnose/Service sowie für den einmaligen Boot-Check gedacht (ein bereits vor dem Einschalten des Display-Controllers bestehender Fehler wird sonst nicht per Broadcast nachgemeldet).
 
 ---
 
@@ -749,6 +801,57 @@ Hier ist jeder Befehl in einem eigenen Absatz beschrieben: Was er macht, wie man
 
 ---
 
+### Dipol‑Flag & Antennenwahl
+
+#### `GETANTDP1` / `GETANTDP2` / `GETANTDP3` {#cmd-GETANTDP1}
+
+**Was es macht:** Dipol‑Flag der Antenne n lesen (`0` = normale Richtantenne, `1` = Dipol mit zweiter Keule ±180°).
+
+**Details:** Wird im Rotor (NVS) gespeichert. Der Display‑Controller liest alle drei Flags beim Boot und nutzt sie für kürzesten Fahrweg (Haupt‑ vs. Rückkeule), logische Anzeige und LED‑Ring (zwei gegenüberliegende Sektoren).
+
+**Telegramm (Beispiel Ant. 1):** `#0:20:GETANTDP1:1:20,01$`  
+**Antwort:** `#20:0:ACK_GETANTDP1:<0|1>:<CS>$`
+
+---
+
+#### `SETANTDP1` / `SETANTDP2` / `SETANTDP3` {#cmd-SETANTDP1}
+
+**Was es macht:** Dipol‑Flag der Antenne n setzen (`0`/`1`) und speichern.
+
+**Telegramm (Beispiel):** `#0:20:SETANTDP1:1:20,01$`  
+**Antwort:** `#20:0:ACK_SETANTDP1:1:<CS>$`
+
+---
+
+#### `GETANTNAME1` / `GETANTNAME2` / `GETANTNAME3` {#cmd-GETANTNAME1}
+
+**Was es macht:** Antennenbezeichner (Anzeige‑Label) vom Rotor lesen.
+
+**Telegramm:** `#0:20:GETANTNAME1:0:20$`  
+**Antwort:** `#20:0:ACK_GETANTNAME1:<NAME>;0:<CS>$` (`;0` optional für CS ohne Ziffern im Namen)
+
+**Details:** Der Display‑Controller fragt beim Boot `GETANTNAME1→2→3` ab und aktualisiert die UI‑Labels. Persistenz liegt am Rotor (NVS), nicht in der Controller‑`config.json`.
+
+---
+
+#### `SETANTNAME1` / `SETANTNAME2` / `SETANTNAME3` {#cmd-SETANTNAME1}
+
+**Was es macht:** Antennenbezeichner speichern (Rotor‑NVS).
+
+**Details:** Kein Doppelpunkt `:` im Namen. Der Display‑Controller übernimmt geänderte Namen vom Bus (Sniff) und aktualisiert die Anzeige. `SETCONANTNAME*` am Controller leitet zusätzlich `SETANTNAME*` an den Rotor weiter.
+
+---
+
+#### `SETASELECT` {#cmd-SETASELECT}
+
+**Was es macht:** Aktive Antenne **1…3** wählen (UI, Versatz, Dipol, Öffnungswinkel).
+
+**Details:** Kein Pending/ACK‑Pflicht. Typisch Broadcast `DST = 255` oder Unicast an die Rotor‑ID. Der Display‑Controller übernimmt die Auswahl in `last_antenna` / UI; PC‑Software sollte bei Wechsel auch `GETASELECT` am Controller nutzen können.
+
+**Telegramm:** `#0:255:SETASELECT:2:<CS>$` (CS = SRC + 255 + 2)
+
+---
+
 #### `SETCAL` {#cmd-SETCAL}
 
 **Was es macht:** Kalibrierfahrt starten (0→360→0) und Stromprofil lernen.
@@ -899,7 +1002,7 @@ Hier ist jeder Befehl in einem eigenen Absatz beschrieben: Was er macht, wie man
 
 **Was es macht:** Max-Winkel lesen.
 
-**Details:** In 0,01°.
+**Details:** Intern in **0,01°** (`g_axisMaxDeg01` / NVS‑Key `amax`). ACK kann als große Ganzzahl (z. B. `42000` = 420°) oder als Grad mit Komma erscheinen — Clients sollten Werte **> 1000** als 0,01°‑Einheiten interpretieren. Bei Encoder‑Typ 3 typisch **420°**; sonst **360°**. Der Display‑Controller liest den Wert beim Boot und setzt damit den wirksamen Fahr‑/Anzeigebereich.
 
 ---
 
@@ -907,7 +1010,7 @@ Hier ist jeder Befehl in einem eigenen Absatz beschrieben: Was er macht, wie man
 
 **Was es macht:** Max-Winkel setzen.
 
-**Details:** Typisch 360,00.
+**Details:** Typisch `360,00` (Typ 1/2) bzw. `420,00` (Typ 3). Nach Änderung Homing und Positionsanzeige prüfen.
 
 ---
 
@@ -1245,13 +1348,17 @@ Ergänzung zu Abschnitt [„Encoder-Varianten“](#encoders): Ring vs. Motor kö
 
 #### `GETENCTYPE` {#cmd-GETENCTYPE}
 
-**Was es macht:** Encoder-Variante lesen: `1` = Axis/Motor, `2` = Ring.
+**Was es macht:** Encoder-Variante lesen.
+
+**Details:** `1` = Axis/Motor, `2` = Ring (360°), `3` = erweiterter Ring (Fahrbereich laut `GETMAXDG`, typ. 420°). Siehe [Abschnitt 2](#encoders). Der Display‑Controller fragt dies beim Boot ab.
 
 ---
 
 #### `SETENCTYPE` {#cmd-SETENCTYPE}
 
-**Was es macht:** Encoder-Variante setzen (`1` oder `2`). Nach Wechsel Homing und Counts prüfen.
+**Was es macht:** Encoder-Variante setzen (`1`, `2` oder `3`).
+
+**Details:** Nach Wechsel Homing, Counts (`SETENCCRI`/`SETENCCAX`) und bei Typ 3 `SETMAXDG` prüfen.
 
 ---
 
@@ -1580,9 +1687,9 @@ Hier sind die Variablen in einfachen Worten erklärt. Wenn „gut“ genannt wir
 
 **Kurz:** Max-Winkel (0,01°)
 
-**Default:** `static int32_t g_axisMaxDeg01 = 36000;`
+**Default:** `static int32_t g_axisMaxDeg01 = 36000;` (bei Encoder‑Typ 3 typisch `42000` = 420°)
 
-**Speicherung:** Ja (Key `amax`). Ändern über RS485: **SETMAXDG/GETMAXDG**.
+**Speicherung:** Ja (Key `amax`). Ändern über RS485: **SETMAXDG/GETMAXDG**. Der Display‑Controller übernimmt den Wert beim Boot und nutzt ihn als Fahr‑/Anzeigespannweite (`pwm_config_get_axis_span_deg()`).
 
 ---
 

@@ -4,16 +4,9 @@
  * CS-Format wie _fmt_cs: ganzzahlig ohne ",00", sonst bis zu zwei Nachkommastellen (Komma).
  *
  * Bus-Regel: Pro Anfrage ein ausstehendes Telegramm; nächste Anfrage erst nach ACK (oder Timeout).
- * SETASELECT (DST 255): kein Pending/ACK — sofort senden.
- * SETPOSCC: Encoder-Vorschau — DST = konfigurierte Rotor-Slave-ID (wie SETPOSDG). Der Rotor antwortet nicht sinnvoll
- * (NAK NOTIMPL), andere Clients filtern nach DST bzw. Payload „deg;rotor_id“ (USB-Spiegel wie bisher).
- * SETCONIDF / SETCONTID (DST 255): neue Controller-master_id → config.json + ACK_SETCONIDF bzw. ACK_SETCONTID.
- * GETANEMO/GETTEMPA/GETWINDDIR/GETTEMPM: nur Stillstand, ohne Fremd-PC; ACKs auch bei PC-Mitlesen.
- * GETCONANO/SETCONANO: Anemometer/Wetter-Tab (1/0) in config.json; bei 0 weiter GETTEMPA (Außentemp Rotor-Info).
- * GETCONDELTA/SETCONDELTA: Encoder-Schritt 1 oder 10 Zehntelgrad (0,1° bzw. 1° pro Raste) → config encoder_delta.
- * GETCONCHA/SETCONCHA: Antennenwechsel 1 = taget behalten + SETPOS, 0 = taget = Ist-Anzeige (config concha).
- * GETCONLEDP/SETCONLEDP: NeoPixel-Ring global 0…100 % (config.json conledp auf FFat).
- * GETTEMPM zyklisch alle ROTOR_MOTOR_TEMP_POLL_MS (5 s); Wetter-GETs unverändert gestaffelt.
+ * SETASELECT: aktive Antenne 1…3 — Unicast an AZ-Rotor-ID (Speicher im AZ); Broadcast/Unicast mitschneiden.
+ * GETASELECT: Boot-Lesen vom AZ; PC-Anfrage an Controller → lokale Cache-Antwort (last_antenna).
+ * Ohne AZ (rotor_id/AZ = 0, nur EL): keine Antennenwahl, kein SET/GET ASELECT.
  *
  * Verbindung: Fehler 10 (Verbindungstimeout), wenn länger kein Telegramm vom Slave (SRC=Rotor-ID)
  * oder vor erster Antwort nur Timeouts — PC- oder Controller-Abfragen zählen (ROTOR_CONN_LOST_TIMEOUT_MS).
@@ -22,10 +15,13 @@
  * wieder antwortet; danach Referenz/GETPOSDG wie bei Boot. GETERR/ACK_ERR bleibt für echte Slave-Fehler.
  * Boot: zuerst 3× TEST:0 (Ping, je ROTOR_RS485_ACK_TIMEOUT_MS); ohne ACK_TEST/NAK_TEST → sofort Fehler 10.
  *
- * Zweiter Master auf demselben RS485-Segment: Mitläufer-Modus wenn DST = Rotor-Slave-ID und SRC ein
+ * Zweiter Master auf demselben RS485-Segment: Mitläufer-Modus wenn DST = AZ- oder EL-Slave-ID und SRC ein
  * anderer Master ist, oder SRC = eigene Master-ID aber andere Zeile als unser letzter TX (gleiche ID).
  * Gleiche Master-ID ohne Bus-Echo: jede fremde Unicast-Zeile löst Mitläufer aus; Echo der eigenen Zeile
  * innerhalb ROTOR_OWN_DST_SLAVE_LINE_MATCH_MS wird ignoriert.
+ * Mitläufer: GETPOSDG/SETPOSDG/GETREF beider Achsen mitschneiden → App-Cache; beim AZ↔EL-Umschalten
+ * aktuelle Ist/Soll-Anzeige aus dem Cache.
+ * EL-Boot: GETROTORTYPE (1/2/3) → Typ 2 = EL 0…90°, Typ 3 = 0…180°; danach GETREF/GETPOSDG.
  *
  * Fremd-Master auf dem Bus (z. B. PC ID 1, Display ID 2): früher wurde komplett kein eigenes GETPOSDG
  * mehr gesendet und GETPOSDG-Timeouts löschten das Pending — Ist lief nur über fremde ACKs → Nachlaufen.
@@ -44,6 +40,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#include "firmware_version.h"
 #include "pwm_config.h"
 #include "rotor_app.h"
 #include "rotor_error_app.h"
@@ -66,6 +63,10 @@ extern "C" void rotor_app_antenna_offset_changed(void);
 #ifndef ROTOR_RS485_ACK_TIMEOUT_MS
 #define ROTOR_RS485_ACK_TIMEOUT_MS 500u
 #endif
+/** Boot-Param-GETs (ANTOFF/ANTDP/ANGLE/…): nach so vielen Timeouts diesen Schritt überspringen. */
+#ifndef ROTOR_BOOT_PARAM_MAX_TIMEOUTS
+#define ROTOR_BOOT_PARAM_MAX_TIMEOUTS 4u
+#endif
 /** SETPOSDG-ACK kommt bei hoher Fremdlast oft spaeter als 500 ms -> sonst unnoetiger Doppelversand. */
 #ifndef ROTOR_RS485_SETPOSDG_ACK_TIMEOUT_MS
 #define ROTOR_RS485_SETPOSDG_ACK_TIMEOUT_MS 1200u
@@ -85,7 +86,7 @@ extern "C" void rotor_app_antenna_offset_changed(void);
 
 /** Nach erstem „angekommen“ (Toleranz): GETPOSDG noch so lange (Endlage kann noch leicht nachziehen) */
 #ifndef ROTOR_POLL_POS_GRACE_MS
-#define ROTOR_POLL_POS_GRACE_MS 600u
+#define ROTOR_POLL_POS_GRACE_MS 2000u
 #endif
 
 #ifndef ROTOR_PERIODIC_GETREF_MS
@@ -111,14 +112,15 @@ extern "C" void rotor_app_antenna_offset_changed(void);
 #define ROTOR_OWN_DST_SLAVE_LINE_MATCH_MS 280u
 #endif
 
-/** Referenz + Betrieb: keine Antwort vom Rotor (Slave) seit so lang → Fehler 10 Verbindungstimeout
- * (gilt auch wenn nur der PC fragt und der Controller selbst nicht sendet). */
+
+/** Referenz + Betrieb: keine Antwort vom Rotor (Slave) seit so lang → Fehler 10 Verbindungstimeout.
+ * Der Controller pollt regelmäßig; Timeout daher bewusst deutlich unter 5 s halten. */
 #ifndef ROTOR_CONN_LOST_TIMEOUT_MS
-#define ROTOR_CONN_LOST_TIMEOUT_MS 5500u
+#define ROTOR_CONN_LOST_TIMEOUT_MS 2800u
 #endif
-/** Bei ausstehendem SETPOSDG ACK darf der Link-Watchdog nicht sofort auf Fehler 10 springen. */
+/** Bei ausstehendem SETPOSDG ACK etwas mehr Luft, aber weiterhin deutlich unter 5 s. */
 #ifndef ROTOR_CONN_LOST_TIMEOUT_SETPOSDG_MS
-#define ROTOR_CONN_LOST_TIMEOUT_SETPOSDG_MS 5000u
+#define ROTOR_CONN_LOST_TIMEOUT_SETPOSDG_MS 3200u
 #endif
 
 /** Abstand zwischen GETANEMO / GETTEMPA / GETWINDDIR (zyklisch); jede Größe alle 3 s */
@@ -143,15 +145,52 @@ enum class Pending : uint8_t {
     GetAntOff1,
     GetAntOff2,
     GetAntOff3,
+    GetAntDp1,
+    GetAntDp2,
+    GetAntDp3,
     GetAngle1,
     GetAngle2,
     GetAngle3,
+    GetEncType,
+    GetMaxDg,
+    GetRotorType,
+    GetAntName1,
+    GetAntName2,
+    GetAntName3,
+    GetAselect,
     GetAnemo,
     GetTempA,
     GetWindDir,
     GetTempM,
+    GetEndStc,
+    GetAxisEncType,
     Test
 };
+
+/** Einmalige Boot-Leseabfragen (Versatz/Dipol/Winkel/Namen) — auch im Mitläufer-Modus nötig. */
+static bool is_antenna_boot_get_pending(Pending p)
+{
+    switch (p) {
+    case Pending::GetAntOff1:
+    case Pending::GetAntOff2:
+    case Pending::GetAntOff3:
+    case Pending::GetAntDp1:
+    case Pending::GetAntDp2:
+    case Pending::GetAntDp3:
+    case Pending::GetAngle1:
+    case Pending::GetAngle2:
+    case Pending::GetAngle3:
+    case Pending::GetEncType:
+    case Pending::GetMaxDg:
+    case Pending::GetAntName1:
+    case Pending::GetAntName2:
+    case Pending::GetAntName3:
+    case Pending::GetAselect:
+        return true;
+    default:
+        return false;
+    }
+}
 
 static bool is_proxy_blocked_poll_pending(Pending p)
 {
@@ -162,9 +201,19 @@ static bool is_proxy_blocked_poll_pending(Pending p)
     case Pending::GetAntOff1:
     case Pending::GetAntOff2:
     case Pending::GetAntOff3:
+    case Pending::GetAntDp1:
+    case Pending::GetAntDp2:
+    case Pending::GetAntDp3:
     case Pending::GetAngle1:
     case Pending::GetAngle2:
     case Pending::GetAngle3:
+    case Pending::GetEncType:
+    case Pending::GetMaxDg:
+    case Pending::GetRotorType:
+    case Pending::GetAntName1:
+    case Pending::GetAntName2:
+    case Pending::GetAntName3:
+    case Pending::GetAselect:
     case Pending::GetAnemo:
     case Pending::GetTempA:
     case Pending::GetWindDir:
@@ -187,12 +236,53 @@ static rotor_rs485_target_cb_t s_target_cb = nullptr;
 static bool s_pending_antenna_offset_notify = false;
 /** SET* config: UI (LVGL) in rotor_rs485_idle_tasks; config.json siehe s_pending_pwm_config_save */
 static bool s_pending_config_changed_from_bus = false;
+/** GETROTORTYPE → EL-Arc/Encoder-Limit im Haupt-loop anwenden (nicht aus Parser-Task). */
+static bool s_pending_el_limits_changed = false;
+/** true nach gültigem ACK_GETROTORTYPE (sonst bei EL nachfragen). */
+static bool s_el_rotor_type_known = false;
 /** config.json: pwm_config_save() nur im Haupt-loop, nicht im RS485-/USB-Parser (Proxy/FFat/WDT). */
 static bool s_pending_pwm_config_save = false;
+/** true: nächstes idle_tasks speichert ohne Debounce (SETCONREMOTE u. ä.). */
+static bool s_force_pwm_config_save = false;
+/** Debounce: Speichern erst nach Ruhe / spätestens nach Max-Wartezeit. */
+static uint32_t s_pwm_config_save_first_ms = 0;
+static uint32_t s_pwm_config_save_last_ms = 0;
+#ifndef ROTOR_PWM_CONFIG_SAVE_DEBOUNCE_MS
+#define ROTOR_PWM_CONFIG_SAVE_DEBOUNCE_MS 1500u
+#endif
+#ifndef ROTOR_PWM_CONFIG_SAVE_MAX_WAIT_MS
+#define ROTOR_PWM_CONFIG_SAVE_MAX_WAIT_MS 5000u
+#endif
 
 static inline void schedule_pwm_config_save_from_bus(void)
 {
-    s_pending_pwm_config_save = true;
+    const uint32_t now = millis();
+    if (!s_pending_pwm_config_save) {
+        s_pending_pwm_config_save = true;
+        s_pwm_config_save_first_ms = now;
+        s_pwm_config_save_last_ms = now;
+        return;
+    }
+    /* Schon pending und bereits „sofort“ fällig (z. B. nach SETCONFRQ): Debounce nicht
+     * durch spätere Soft-Saves (Antennenname/PWM) wieder auf 1,5 s hochziehen — sonst
+     * geht confrq bei schnellem Reset verloren und bleibt der alte Wert (oft 500). */
+    const bool already_due =
+        (uint32_t)(now - s_pwm_config_save_last_ms) >= ROTOR_PWM_CONFIG_SAVE_DEBOUNCE_MS;
+    if (!already_due) {
+        s_pwm_config_save_last_ms = now;
+    }
+}
+
+/** Wie schedule, aber nächstes idle_tasks speichert sofort (Pieps/kritische Einzelwerte). */
+static inline void schedule_pwm_config_save_from_bus_now(void)
+{
+    const uint32_t now = millis();
+    if (!s_pending_pwm_config_save) {
+        s_pending_pwm_config_save = true;
+        s_pwm_config_save_first_ms = now;
+    }
+    s_pwm_config_save_last_ms = now - ROTOR_PWM_CONFIG_SAVE_DEBOUNCE_MS;
+    s_force_pwm_config_save = true;
 }
 
 /** SETASELECT per Bus/USB: Flash/LVGL nur in rotor_rs485_idle_tasks (nicht Parser-/Bridge-Task). */
@@ -217,6 +307,13 @@ static bool s_pos_ui_deferred = false;
 /** GETREF-Status in loop() flushen (kein LVGL-Lock im RX-Task). */
 static bool s_ref_ui_deferred = false;
 static bool s_ref_ui_value = false;
+/** Soll-Callback (taget_dg) ruft lvgl_port_lock(-1) auf — darf nicht direkt aus dem Parser/Sniffer-Task
+ * laufen (task_sniffer, Prio 4): haelt LVGL z. B. waehrend eines Redraws den Lock laenger, blockiert das
+ * den gesamten RS485-Empfang (s_sniff_q laeuft voll/wird verworfen) und s_last_slave_rx_ms bleibt stehen,
+ * obwohl der Bus objektiv weiterlaeuft — Folge: spontaner „Verbindungsfehler“ (10) + Soll springt auf Ist,
+ * sobald der Stau aufgeloest wird. Deshalb wie Ist/Referenz erst in loop() (rotor_rs485_idle_tasks) flushen. */
+static bool s_target_ui_deferred = false;
+static float s_target_ui_deg = 0.0f;
 
 /** ACK_GETANEMO / ACK_GETTEMPA / ACK_GETTEMPM / ACK_WINDDIR (Anzeige in loop(), nicht im Parser) */
 static float s_last_wind_kmh = 0.0f;
@@ -235,11 +332,30 @@ static uint32_t s_next_ref_poll_ms = 0;
 
 static bool s_poll_pos = false;
 static float s_target_deg = 0.0f;
+/**
+ * Zweite Achse noch in Fahrt nach Umschalten: weiter GETPOSDG (Deadman), ohne UI zu wechseln.
+ * s_ka_* = Keepalive für die inaktive Slave-ID.
+ */
+static bool s_ka_active = false;
+static uint8_t s_ka_slave_id = 0;
+static float s_ka_target_deg = 0.0f;
+static uint32_t s_ka_next_poll_ms = 0;
+static uint32_t s_ka_grace_end_ms = 0;
+static bool s_pos_poll_prefer_ka = false;
+/** Slave-ID des ausstehenden GETPOSDG (aktiv oder Keepalive). */
+static uint8_t s_getposdg_dst = 0;
 /** Zuletzt mit SETPOSDG gesendeter Soll (Anzeige bei Ankunft, nicht Bus-Float → kein 309 vs 309,1) */
 static float s_goto_commanded_deg = 0.0f;
 static uint32_t s_next_pos_poll_ms = 0;
 /** 0 = noch keine Nachlaufphase; sonst millis()-Zeitpunkt, ab dem Positions-Polling beendet werden darf */
 static uint32_t s_pos_grace_end_ms = 0;
+
+/** Verbindungs-Watchdog (Fehler 10) hat mitten in einer Fahrt gefeuert: Merkt sich, dass GETPOSDG-Polling
+ * (bzw. Fremd-Fahrt-Tracking) fortgesetzt werden muss, sobald der Bus wieder eine gültige Zeile liefert —
+ * sonst bleibt die Anzeige nach einem kurzen Aussetzer (< 1 s) im Idle-Polling stehen, obwohl der Rotor
+ * weiterdreht (siehe rotor_rs485_loop Verbindungs-Watchdog und die Slave-RX-Behandlung). */
+static bool s_resume_poll_pos_after_conn_loss = false;
+static bool s_resume_remote_setpos_after_conn_loss = false;
 
 /** Boot: 2 s warten, dann GETREF → optional GETPOSDG wenn referenziert */
 static bool s_boot_done = false;
@@ -278,6 +394,11 @@ static bool s_err10_recovery_getref_pending = false;
 /** SETPOSCC: zuletzt gewünschter Busgrad — Versand erst in rotor_rs485_loop bei freiem Pending (kein TX vor ACK/GETPOS). */
 static bool s_setposcc_queued = false;
 static float s_setposcc_queued_deg = 0.0f;
+/** Letzter SETPOSCC-TX — Watchdog pausieren, solange nur Vorschau läuft (kein Slave-ACK). */
+static uint32_t s_last_setposcc_tx_ms = 0;
+#ifndef ROTOR_SETPOSCC_WATCHDOG_GRACE_MS
+#define ROTOR_SETPOSCC_WATCHDOG_GRACE_MS 3000u
+#endif
 
 /** HW-Taster: Soll = Ist — SETPOSDG wiederholen bis ACK (Bus busy / kein ACK). */
 static bool s_hw_snap_retarget_active = false;
@@ -287,6 +408,11 @@ static float s_hw_snap_retarget_deg = 0.0f;
 static bool s_remote_setpos_motion = false;
 static float s_remote_setpos_target_deg = 0.0f;
 static uint32_t s_remote_setpos_grace_end_ms = 0;
+/** Mitläufer: Fremd-SETPOSDG an die inaktive Achse (andere konfigurierte Slave-ID). */
+static bool s_remote_other_motion = false;
+static uint8_t s_remote_other_slave_id = 0;
+static float s_remote_other_target_deg = 0.0f;
+static uint32_t s_remote_other_grace_end_ms = 0;
 
 /** SETPWM: zuletzt gesendeter Wert (Timeout-Retry) */
 static uint8_t s_setpwm_value = 0;
@@ -294,9 +420,69 @@ static uint8_t s_setpwm_value = 0;
 /** Nach Boot: GETANTOFF1→2→3 (Versätze vom Rotor); phase 0 = GET1 noch nicht gesendet */
 static bool s_antenna_boot_pending = true;
 static uint8_t s_antenna_boot_phase = 0;
+/** Einmalig GETASELECT vom AZ (Speicher der Antennenwahl) vor der Versatz-Kette. */
+static bool s_aselect_boot_pending = true;
+/** Timeouts hintereinander für aktuellen Boot-Param-Schritt (dann weiter / Defaults). */
+static uint8_t s_boot_param_timeout_count = 0;
 /** Nach erfolgreicher GETANTOFF-Kette: GETANGLE1→2→3 (Öffnungswinkel); phase 0 = inaktiv */
 static bool s_angle_boot_pending = false;
 static uint8_t s_angle_boot_phase = 0;
+/** Nach GETANGLE: GETENCTYPE → GETMAXDG (Encoder-Typ / Fahrbereich bis 720°); phase 0 = inaktiv */
+static bool s_enc_boot_pending = false;
+static uint8_t s_enc_boot_phase = 0;
+/** Nach GETMAXDG: GETANTNAME1→2→3 (Namen vom Rotor); phase 0 = inaktiv */
+static bool s_name_boot_pending = false;
+static uint8_t s_name_boot_phase = 0;
+/** Nach Namen: einmal Ref/Pos/Temp (auch Mitläufer); phase 0 = aus */
+static bool s_status_boot_pending = false;
+static uint8_t s_status_boot_phase = 0;
+/* 1=GETREF 2=GETPOSDG 3=GETTEMPA 4=GETTEMPM 5=GETANEMO 6=GETWINDDIR */
+
+/** Nach AZ↔EL: nächstes GETPOSDG ohne Soll=Ist-Align (Cache behalten). */
+static bool s_axis_switch_pos_refresh = false;
+/** Referenz der aktiven Slave-ID durch eigenes ACK_GETREF bestätigt (nach Achsenwechsel erst false). */
+static bool s_ref_state_known = false;
+/** HW-Taster/Fehler-10-Quittung während belegtem Bus: SETREF im nächsten freien Slot senden. */
+static bool s_setref_queued = false;
+/** Parameter des zuletzt gesendeten SETREF ("1" = Homing, "0" = nur Fehler quittieren). */
+static const char *s_setref_param = "1";
+/** GETENDSTC je Achse (0=AZ, 1=EL). s_endstc_learned_id = Slave-ID, für die der Wert gilt (0 = unbekannt). */
+static bool s_axis_has_endstop[2] = {true, true};
+static uint8_t s_endstc_learned_id[2] = {0u, 0u};
+static uint8_t s_endstc_timeout_count = 0;
+/** GETENCTYPE je Achse (1/2 inkremental, 3 SSI, 4 Inklinometer); 0 = unbekannt. */
+static uint8_t s_axis_enc_type[2] = {0u, 0u};
+static uint8_t s_enctype_learned_id[2] = {0u, 0u};
+static uint8_t s_axis_enctype_timeout_count = 0;
+#ifndef ROTOR_ENDSTC_MAX_TIMEOUTS
+#define ROTOR_ENDSTC_MAX_TIMEOUTS 3u
+#endif
+/** Achsenwechsel: GETREF an die neue Slave-ID, bis Antwort (auch als Mitläufer). */
+static bool s_axis_switch_getref_pending = false;
+static uint32_t s_axis_switch_getref_next_ms = 0;
+static uint8_t s_axis_switch_getref_tries = 0;
+#ifndef ROTOR_AXIS_SWITCH_GETREF_MAX_TRIES
+#define ROTOR_AXIS_SWITCH_GETREF_MAX_TRIES 5u
+#endif
+/** Nach AZ-Status-Boot: kurz EL-Slave GETROTORTYPE→GETREF(+GETPOSDG) → App-Cache, dann zurück auf AZ. */
+static bool s_el_status_boot_pending = false;
+static uint8_t s_el_status_boot_phase = 0; /* 1=GETROTORTYPE 2=GETREF 3=GETPOSDG */
+/** Timeouts während EL-Probe (unerreichbare EL darf AZ nicht mit Fehler 10 blockieren). */
+static uint8_t s_el_probe_timeout_count = 0;
+#ifndef ROTOR_EL_PROBE_MAX_TIMEOUTS
+#define ROTOR_EL_PROBE_MAX_TIMEOUTS 2u
+#endif
+/** Fehlversuche GETROTORTYPE nach Boot (dann Default behalten, nicht endlos pollen). */
+static uint8_t s_el_type_fail_count = 0;
+#ifndef ROTOR_EL_TYPE_MAX_FAILS
+#define ROTOR_EL_TYPE_MAX_FAILS 3u
+#endif
+static uint8_t s_el_boot_saved_slave = 0;
+static bool s_el_boot_saved_ref = false;
+static float s_el_boot_saved_pos = 0.0f;
+static bool s_el_boot_ref = false;
+static float s_el_boot_pos = 0.0f;
+static bool s_el_boot_have_pos = false;
 
 /** Zuletzt #FremdMaster:RotorID:… gesehen (Millis); 0 = noch keiner */
 static uint32_t s_last_foreign_master_to_slave_ms = 0;
@@ -322,10 +508,28 @@ static uint32_t s_next_motortemp_ms = 0;
 static bool s_boot_test_done = false;
 static uint8_t s_boot_test_timeout_count = 0;
 
+static void abort_name_boot(void)
+{
+    s_name_boot_pending = false;
+    s_name_boot_phase = 0;
+    s_status_boot_pending = false;
+    s_status_boot_phase = 0;
+    s_el_status_boot_pending = false;
+    s_el_status_boot_phase = 0;
+}
+
+static void abort_enc_boot(void)
+{
+    s_enc_boot_pending = false;
+    s_enc_boot_phase = 0;
+    abort_name_boot();
+}
+
 static void abort_angle_boot(void)
 {
     s_angle_boot_pending = false;
     s_angle_boot_phase = 0;
+    abort_enc_boot();
 }
 
 static void abort_antenna_boot(void)
@@ -335,27 +539,153 @@ static void abort_antenna_boot(void)
     abort_angle_boot();
 }
 
+static bool boot_param_chain_active(void)
+{
+    return s_aselect_boot_pending || s_antenna_boot_pending || s_angle_boot_pending ||
+           s_enc_boot_pending || s_name_boot_pending;
+}
+
+/** Status-Boot (Ref/Pos/Temp) — einmalig auch unter Fremd-Master. */
+static bool is_status_boot_get_pending(Pending p)
+{
+    if (s_el_status_boot_pending) {
+        return (p == Pending::GetRotorType || p == Pending::GetRef || p == Pending::GetPosDg);
+    }
+    if (!s_status_boot_pending) {
+        return false;
+    }
+    switch (p) {
+    case Pending::GetRef:
+    case Pending::GetPosDg:
+    case Pending::GetTempA:
+    case Pending::GetTempM:
+    case Pending::GetAnemo:
+    case Pending::GetWindDir:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static void status_boot_finished_start_el(void);
+static void el_status_boot_finish(void);
+static bool el_probe_on_timeout(void);
+static void try_el_status_boot_step(void);
+static void clear_remote_other_motion(void);
+static bool parse_ack_getrotortype(const char *line);
+static bool parse_ack_getaselect(const char *line);
+static bool parse_ack_getantoff1(const char *line);
+static bool parse_ack_getantoff2(const char *line);
+static bool parse_ack_getantoff3(const char *line);
+static bool parse_ack_getantdp1(const char *line);
+static bool parse_ack_getantdp2(const char *line);
+static bool parse_ack_getantdp3(const char *line);
+static bool parse_ack_getangle1(const char *line);
+static bool parse_ack_getangle2(const char *line);
+static bool parse_ack_getangle3(const char *line);
+static bool parse_ack_getenctype(const char *line);
+static bool parse_ack_getmaxdg(const char *line);
+static bool parse_endstc_reply(const char *line);
+static bool parse_axis_enctype_reply(const char *line);
+static bool parse_ack_getantname1(const char *line);
+static bool parse_ack_getantname2(const char *line);
+static bool parse_ack_getantname3(const char *line);
+
+static bool is_boot_read_allowed(Pending p)
+{
+    if (p == Pending::GetAselect && s_aselect_boot_pending) {
+        return true;
+    }
+    if (is_antenna_boot_get_pending(p) && boot_param_chain_active()) {
+        return true;
+    }
+    return is_status_boot_get_pending(p);
+}
+
 static void notify_target(float deg);
 static void flush_deferred_position_ui(void);
 static void flush_deferred_ref_ui(void);
+static void flush_deferred_target_ui(void);
 static void try_flush_setposcc(void);
 
 /** Bei Fehler stoppt der Slave — kein weiteres GETPOSDG-Polling / keine ausstehende Pos-Sync bis Recovery */
 static void stop_fault_motion_polling(void)
 {
+    s_setref_queued = false;
     s_poll_pos = false;
     s_pos_grace_end_ms = 0;
     s_align_target_after_pos_read = false;
     s_remote_setpos_motion = false;
     s_remote_setpos_grace_end_ms = 0;
+    s_remote_other_motion = false;
+    s_remote_other_slave_id = 0;
+    s_remote_other_grace_end_ms = 0;
     s_hw_snap_retarget_active = false;
     s_poll_ref = false;
     s_request_pos_after_homing = false;
     s_homing_wait_unref_seen = false;
+    s_ka_active = false;
+    s_ka_slave_id = 0;
+    s_ka_grace_end_ms = 0;
 }
 
 void rotor_rs485_set_master_id(uint8_t id) { s_master_id = id; }
-void rotor_rs485_set_slave_id(uint8_t id) { s_slave_id = id; }
+void rotor_rs485_set_slave_id(uint8_t id)
+{
+    if (s_slave_id == id) {
+        return;
+    }
+    const uint8_t old_id = s_slave_id;
+    /* Aktive Fahrt der bisherigen Achse: Keepalive-GETPOSDG (Deadman), UI wechselt. */
+    if (s_poll_pos && old_id != 0) {
+        s_ka_active = true;
+        s_ka_slave_id = old_id;
+        s_ka_target_deg = s_target_deg;
+        s_ka_next_poll_ms = millis();
+        s_ka_grace_end_ms = s_pos_grace_end_ms;
+    }
+    /* Mitläufer-Remote-Fahrt der bisherigen Achse → other-Tracking; der neuen Achse → aktiv. */
+    if (s_remote_setpos_motion && old_id != 0) {
+        s_remote_other_motion = true;
+        s_remote_other_slave_id = old_id;
+        s_remote_other_target_deg = s_remote_setpos_target_deg;
+        s_remote_other_grace_end_ms = s_remote_setpos_grace_end_ms;
+        s_remote_setpos_motion = false;
+        s_remote_setpos_grace_end_ms = 0;
+    }
+    if (s_remote_other_motion && id == s_remote_other_slave_id) {
+        s_remote_setpos_motion = true;
+        s_remote_setpos_target_deg = s_remote_other_target_deg;
+        s_remote_setpos_grace_end_ms = s_remote_other_grace_end_ms;
+        clear_remote_other_motion();
+    }
+    s_slave_id = id;
+    /* Achsenwechsel: alter Referenzstatus gilt nicht für die neue Slave-ID. Bis zum eigenen
+     * ACK_GETREF zählt der vom App-Cache geseedete Wert (rotor_rs485_seed_referenced) —
+     * s_slave_referenced hier nicht auf false zwingen, sonst bliebe „Nicht referenziert“ stehen,
+     * wenn das GETREF im Mitläufer-Modus oder bei belegtem Bus ausfällt. */
+    s_ref_state_known = false;
+    s_axis_switch_getref_pending = true;
+    s_axis_switch_getref_next_ms = millis();
+    s_axis_switch_getref_tries = 0;
+    s_poll_ref = false;
+    s_pos_ui_deferred = false;
+    s_ref_ui_deferred = false;
+    s_axis_switch_pos_refresh = true;
+
+    if (s_ka_active && id == s_ka_slave_id) {
+        /* Zurück zur noch fahrenden Achse: Polling wieder aktiv übernehmen. */
+        s_poll_pos = true;
+        s_target_deg = s_ka_target_deg;
+        s_pos_grace_end_ms = s_ka_grace_end_ms;
+        s_next_pos_poll_ms = millis();
+        s_ka_active = false;
+        s_ka_slave_id = 0;
+    } else {
+        s_poll_pos = false;
+        s_pos_grace_end_ms = 0;
+    }
+}
 
 void rotor_rs485_set_ref_callback(rotor_rs485_ref_cb_t cb) { s_ref_cb = cb; }
 void rotor_rs485_set_position_callback(rotor_rs485_pos_cb_t cb) { s_pos_cb = cb; }
@@ -365,9 +695,21 @@ void rotor_rs485_idle_tasks(void)
 {
     flush_deferred_position_ui();
     flush_deferred_ref_ui();
-    if (s_pending_pwm_config_save) {
-        s_pending_pwm_config_save = false;
-        pwm_config_save();
+    flush_deferred_target_ui();
+    if (s_pending_pwm_config_save || s_force_pwm_config_save) {
+        const uint32_t now = millis();
+        const bool quiet =
+            (uint32_t)(now - s_pwm_config_save_last_ms) >= ROTOR_PWM_CONFIG_SAVE_DEBOUNCE_MS;
+        const bool max_wait =
+            s_pending_pwm_config_save &&
+            (uint32_t)(now - s_pwm_config_save_first_ms) >= ROTOR_PWM_CONFIG_SAVE_MAX_WAIT_MS;
+        if (s_force_pwm_config_save || quiet || max_wait) {
+            s_pending_pwm_config_save = false;
+            s_force_pwm_config_save = false;
+            s_pwm_config_save_first_ms = 0;
+            s_pwm_config_save_last_ms = 0;
+            pwm_config_save();
+        }
     }
     if (s_pending_remote_antenna) {
         s_pending_remote_antenna = false;
@@ -380,6 +722,14 @@ void rotor_rs485_idle_tasks(void)
     if (s_pending_config_changed_from_bus) {
         s_pending_config_changed_from_bus = false;
         rotor_app_config_changed_from_bus();
+    }
+    if (s_pending_el_limits_changed) {
+        s_pending_el_limits_changed = false;
+        rotor_app_el_limits_changed();
+    }
+    /* EL-Typ noch unbekannt: erneut anfragen (Boot verpasst / Timeout). */
+    if (!s_el_rotor_type_known) {
+        rotor_rs485_request_el_rotor_type();
     }
 }
 
@@ -414,6 +764,44 @@ bool rotor_rs485_is_boot_done(void) { return s_boot_done; }
 
 bool rotor_rs485_is_startup_error_checked(void) { return s_startup_err_known; }
 
+static void clear_pending();
+
+/** Software läuft schon: TEST/GETREF-Boot des Displays kommt oft nicht durch (USB-Proxy yield).
+ * Gespiegelte Slave-ACKs (Pos/Ref) reichen — sonst bleibt „Initialisiere“ trotz grünem Ring. */
+static void adopt_live_slave_as_boot_complete(void)
+{
+    if (!s_have_slave_rx_ever) {
+        return;
+    }
+    const bool remote_usb =
+        serial_bridge::remote_usb_active() || pwm_config_get_remote_usb() != 0u;
+    if (!remote_usb && !rotor_rs485_is_foreign_pc_listen_mode()) {
+        return;
+    }
+    if (s_pending == Pending::Test) {
+        clear_pending();
+    }
+    s_boot_test_done = true;
+    s_startup_err_known = true;
+    if (!s_boot_done) {
+        if (s_pending == Pending::GetRef || s_pending == Pending::GetPosDg ||
+            s_pending == Pending::GetErr) {
+            clear_pending();
+        }
+        s_boot_done = true;
+        s_boot_phase = 3;
+    }
+    /* Status-/EL-Boot-Ketten beenden — sonst bleibt UI in Boot-Logik hängen. */
+    if (s_status_boot_pending) {
+        s_status_boot_pending = false;
+        s_status_boot_phase = 0;
+    }
+    if (s_el_status_boot_pending) {
+        s_el_status_boot_pending = false;
+        s_el_status_boot_phase = 0;
+    }
+}
+
 bool rotor_rs485_is_referenced(void) { return s_slave_referenced; }
 
 static bool homing_active_internal(void)
@@ -427,12 +815,26 @@ bool rotor_rs485_is_homing(void) { return homing_active_internal(); }
 
 bool rotor_rs485_is_position_polling(void) { return s_poll_pos; }
 
-bool rotor_rs485_is_remote_setpos_motion(void) { return s_remote_setpos_motion; }
+bool rotor_rs485_is_remote_setpos_motion(void)
+{
+    return s_remote_setpos_motion || s_remote_other_motion;
+}
 
 float rotor_rs485_get_last_position_deg(void) { return s_last_pos_ui_deg; }
+float rotor_rs485_get_last_target_bus_deg(void) { return s_goto_commanded_deg; }
+
+bool rotor_rs485_boot_read_in_progress(void)
+{
+    return s_aselect_boot_pending || s_antenna_boot_pending || s_angle_boot_pending || s_enc_boot_pending ||
+           s_name_boot_pending || s_status_boot_pending || s_el_status_boot_pending;
+}
 
 bool rotor_rs485_is_foreign_pc_listen_mode(void)
 {
+    /* Remote USB: Controller ist Soft-Master über USB — kein Mitläufer. */
+    if (serial_bridge::remote_usb_active()) {
+        return false;
+    }
     /* USB-Bridge (PC steuert): lokale Hintergrund-GETs drosseln, auch wenn PC dieselbe Master-ID nutzt. */
     if (serial_bridge::get_mode() == serial_bridge::BridgeMode::PcProxyMaster) {
         return true;
@@ -442,6 +844,139 @@ bool rotor_rs485_is_foreign_pc_listen_mode(void)
         return false;
     }
     return (millis() - s_last_foreign_master_to_slave_ms) < ROTOR_PC_FOREIGN_SILENCE_MS;
+}
+
+static bool foreign_master_target_active(void)
+{
+    /* Remote USB: SETPOSCC/DG immer an den echten Slave (über USB-Proxy), nie an PC-Master-ID. */
+    if (serial_bridge::remote_usb_active()) {
+        return false;
+    }
+    if (s_last_foreign_master_to_slave_ms == 0) {
+        return false;
+    }
+    return (millis() - s_last_foreign_master_to_slave_ms) < ROTOR_PC_FOREIGN_SILENCE_MS;
+}
+
+/** Konfigurierte AZ-/EL-Slave-IDs (0 = Achse aus). */
+static bool is_configured_rotor_slave(unsigned id)
+{
+    if (id == 0u || id == ROTOR_RS485_BROADCAST_ID) {
+        return false;
+    }
+    const uint8_t az = pwm_config_get_rotor_id();
+    if (az != 0u && id == (unsigned)az) {
+        return true;
+    }
+    const uint8_t el = pwm_config_get_rotor_el_id();
+    return (el != 0u && id == (unsigned)el);
+}
+
+/** SETASELECT gilt nur für AZ (oder Broadcast) — nicht für EL. */
+static bool setaselect_dst_is_az_or_broadcast(unsigned dst)
+{
+    if (dst == ROTOR_RS485_BROADCAST_ID) {
+        return true;
+    }
+    const uint8_t az = pwm_config_get_rotor_id();
+    return (az != 0u && dst == (unsigned)az);
+}
+
+static bool is_inactive_rotor_slave(unsigned id)
+{
+    return is_configured_rotor_slave(id) && id != (unsigned)s_slave_id;
+}
+
+static uint8_t axis_index_for_slave_id(unsigned id)
+{
+    const uint8_t el = pwm_config_get_rotor_el_id();
+    if (el != 0u && id == (unsigned)el) {
+        return 1u;
+    }
+    return 0u;
+}
+
+static uint8_t configured_slave_id_for_axis(uint8_t axis)
+{
+    return (axis == 1u) ? pwm_config_get_rotor_el_id() : pwm_config_get_rotor_id();
+}
+
+static bool endstc_known_for_axis(uint8_t axis)
+{
+    const uint8_t id = configured_slave_id_for_axis(axis);
+    return id != 0u && s_endstc_learned_id[axis] == id;
+}
+
+static void store_endstc_for_slave(unsigned src, bool has_endstop)
+{
+    for (uint8_t axis = 0; axis < 2u; ++axis) {
+        const uint8_t id = configured_slave_id_for_axis(axis);
+        if (id != 0u && (unsigned)id == src) {
+            s_axis_has_endstop[axis] = has_endstop;
+            s_endstc_learned_id[axis] = id;
+        }
+    }
+}
+
+/** Unbekannt (noch keine Antwort / alte Firmware) = Endschalter vorhanden → Homing wie bisher. */
+bool rotor_rs485_axis_has_endstop(void)
+{
+    const uint8_t axis = axis_index_for_slave_id(s_slave_id);
+    if (!endstc_known_for_axis(axis)) {
+        return true;
+    }
+    return s_axis_has_endstop[axis];
+}
+
+static bool enctype_known_for_axis(uint8_t axis)
+{
+    const uint8_t id = configured_slave_id_for_axis(axis);
+    return id != 0u && s_enctype_learned_id[axis] == id;
+}
+
+static void store_enctype_for_slave(unsigned src, uint8_t type)
+{
+    for (uint8_t axis = 0; axis < 2u; ++axis) {
+        const uint8_t id = configured_slave_id_for_axis(axis);
+        if (id != 0u && (unsigned)id == src) {
+            s_axis_enc_type[axis] = type;
+            s_enctype_learned_id[axis] = id;
+        }
+    }
+}
+
+/** Absolutencoder (Typ ≠ 1/2, z. B. SSI / Inklinometer): kein Homing. Unbekannt = wie bisher. */
+static bool axis_is_absolute_encoder(void)
+{
+    const uint8_t axis = axis_index_for_slave_id(s_slave_id);
+    if (!enctype_known_for_axis(axis)) {
+        return false;
+    }
+    const uint8_t t = s_axis_enc_type[axis];
+    return t != 0u && t != 1u && t != 2u;
+}
+
+static void clear_remote_other_motion(void)
+{
+    s_remote_other_motion = false;
+    s_remote_other_slave_id = 0;
+    s_remote_other_grace_end_ms = 0;
+}
+
+static void note_foreign_master_to_rotor(unsigned src)
+{
+    /* Remote USB: gespiegelte PC-Polls sind der Soll-Pfad — kein Mitläufer-Timer. */
+    if (serial_bridge::remote_usb_active()) {
+        return;
+    }
+    /* Während AZ-Param-Boot (Versatz/Dipol/Winkel/Namen/ASELECT) kein Mitläufer —
+     * sonst kollidieren Fremd-GETPOSDG mit unseren Boot-GETs und die Kette dauert ewig /
+     * bricht ab → LED-Ring ohne Dipol/Öffnungswinkel. */
+    if (boot_param_chain_active()) {
+        return;
+    }
+    s_last_foreign_master_to_slave_ms = millis();
+    s_foreign_master_src_id = (uint8_t)src;
 }
 
 static void clear_pending()
@@ -485,31 +1020,70 @@ static float normalize_deg_0_360(float d)
     return x;
 }
 
+/** Positions-/Zielwinkel im wirksamen Fahrbereich (360 oder GETMAXDG-Span, z. B. 420/720).
+ * Vor GETMAXDG ist der Span noch 360 — Rohwerte >360 nicht falten,
+ * sonst wird z. B. 372° → 12° und bleibt falsch in der Anzeige. */
+static float normalize_deg_span(float d)
+{
+    const float span = pwm_config_get_axis_span_deg();
+    if (span > 360.5f) {
+        float x = fmodf(d, span);
+        if (x < 0.0f) {
+            x += span;
+        }
+        return x;
+    }
+    /* Span noch unbekannt: Werte über 360 bis GETMAXDG behalten */
+    if (d > 360.5f && d <= 720.0f) {
+        return d;
+    }
+    return normalize_deg_0_360(d);
+}
+
 /**
  * Anzeige: Bus meldet oft 360,00° — normalize_deg_0_360 liefert 0° (gleiche Lage).
  * Dann soll die UI 360° zeigen, nicht 0° (Homing-Endlage / Log: ACK …360,00).
  * Referenziert: manche Slaves melden 0,0…0,5° statt 360° an der Endlage (Restfehler) —
  * sonst zeigt Ist/Soll nach Start fälschlich z.B. 0,2° statt 360°.
+ * Bei Span > 360 bzw. Rohwert >360 (Boot vor GETMAXDG) sind 0° und 360° verschiedene Lagen.
+ * elevation_axis: EL 0…180 — kein 0→360-Mapping (sonst Ist 0° → 360° → App-clamp 180°).
  */
-static float bus_deg_for_ui(float deg_norm, float deg_raw)
+static float bus_deg_for_ui(float deg_norm, float deg_raw, bool elevation_axis)
 {
+    if (elevation_axis) {
+        const float el_max = pwm_config_get_el_max_deg();
+        if (deg_raw < 0.0f) {
+            return 0.0f;
+        }
+        if (deg_raw > el_max) {
+            return el_max;
+        }
+        return deg_raw;
+    }
+    const float span = pwm_config_get_axis_span_deg();
+    if (span > 360.5f || deg_raw > 360.5f) {
+        /* Span-Endlage (z. B. 420,00 → fmod → 0) als Span anzeigen */
+        if (span > 360.5f && deg_norm < 0.01f && deg_raw >= span - 0.5f) {
+            return span;
+        }
+        return deg_norm;
+    }
     if (deg_norm < 0.01f && deg_raw >= 359.5f) {
         return 360.0f;
     }
-    if (s_slave_referenced && deg_raw >= 0.0f && deg_raw <= 0.5f && deg_norm <= 0.5f) {
+    /* Eng um 0,0° halten (nur echter Restfehler, z. B. 0,0…0,05°) — NICHT bis 0,5°: sonst wird jede
+     * echte, angefahrene Position 0,1…0,4° faelschlich als Homing-Endlage (360°) angezeigt, obwohl
+     * der Rotor tatsaechlich dort steht (z. B. Ziel 0,3° oder 0,02°). */
+    if (s_slave_referenced && deg_raw >= 0.0f && deg_raw <= 0.05f && deg_norm <= 0.05f) {
         return 360.0f;
     }
     return deg_norm;
 }
 
-/** Kleinster Winkelabstand 0…180° */
-static float min_angle_diff(float a_deg, float b_deg)
+/** Lineare Bus-Distanz (mechanischer Anschlag — kein Wraparound). */
+static float linear_span_diff(float a_deg, float b_deg)
 {
-    float d = fabsf(normalize_deg_0_360(a_deg) - normalize_deg_0_360(b_deg));
-    if (d > 180.0f) {
-        d = 360.0f - d;
-    }
-    return d;
+    return fabsf(a_deg - b_deg);
 }
 
 /**
@@ -653,10 +1227,97 @@ static void send_request(const char *cmd, const char *params_str, Pending p)
         return;
     }
     if (rotor_rs485_is_foreign_pc_listen_mode() && is_proxy_blocked_poll_pending(p)) {
-        return;
+        /* Einmalige Boot-Leseabfragen (Parameter + Status) auch als Mitläufer erlauben. */
+        if (!is_boot_read_allowed(p)) {
+            return;
+        }
     }
     send_line(cmd, params_str);
+    if (p == Pending::GetPosDg) {
+        s_getposdg_dst = s_slave_id;
+    }
     set_pending(p);
+}
+
+/** Antennen-Param-Boot immer an AZ-ID (nicht aktive Achse / EL). */
+static void send_az_boot_request(const char *cmd, const char *params_str, Pending p)
+{
+    const uint8_t az = pwm_config_get_rotor_id();
+    if (az == 0u) {
+        return;
+    }
+    if (!bus_send_allowed_by_fault()) {
+        return;
+    }
+    if (rotor_rs485_is_foreign_pc_listen_mode() && is_proxy_blocked_poll_pending(p)) {
+        if (!is_boot_read_allowed(p)) {
+            return;
+        }
+    }
+    send_line_to(az, cmd, params_str);
+    set_pending(p);
+}
+
+static void boot_param_reset_timeouts(void)
+{
+    s_boot_param_timeout_count = 0;
+}
+
+/** true = zu viele Timeouts → diesen Boot-Schritt überspringen. */
+static bool boot_param_timeouts_exhausted(void)
+{
+    s_boot_param_timeout_count++;
+    if (s_boot_param_timeout_count >= ROTOR_BOOT_PARAM_MAX_TIMEOUTS) {
+        s_boot_param_timeout_count = 0;
+        return true;
+    }
+    return false;
+}
+
+/** GETPOSDG an beliebige Slave-ID (aktive Achse oder Keepalive der anderen). */
+static void send_getposdg_to(uint8_t dst)
+{
+    if (!bus_send_allowed_by_fault()) {
+        return;
+    }
+    if (rotor_rs485_is_foreign_pc_listen_mode() && !is_boot_read_allowed(Pending::GetPosDg)) {
+        return;
+    }
+    send_line_to(dst, "GETPOSDG", "0");
+    s_getposdg_dst = dst;
+    set_pending(Pending::GetPosDg);
+}
+
+static void ka_clear(void)
+{
+    s_ka_active = false;
+    s_ka_slave_id = 0;
+    s_ka_grace_end_ms = 0;
+    s_ka_next_poll_ms = 0;
+}
+
+/** Keepalive-ACK: Fortschritt der inaktiven Achse; UI unverändert, Cache mitschneiden. */
+static void ka_on_getposdg(float deg)
+{
+    if (!s_ka_active) {
+        return;
+    }
+    const uint8_t el = pwm_config_get_rotor_el_id();
+    const uint8_t axis = (el != 0 && s_ka_slave_id == el) ? 1u : 0u;
+    rotor_app_seed_axis_cache(axis, deg, true);
+
+    if (linear_span_diff(deg, s_ka_target_deg) <= ROTOR_POS_TOL_DEG) {
+        if (s_ka_grace_end_ms == 0) {
+            s_ka_grace_end_ms = millis() + ROTOR_POLL_POS_GRACE_MS;
+        }
+        if ((int32_t)(millis() - s_ka_grace_end_ms) >= 0) {
+            ka_clear();
+            return;
+        }
+    } else {
+        s_ka_grace_end_ms = 0;
+    }
+    s_ka_next_poll_ms = millis() + ROTOR_POLL_GAP_MS;
 }
 
 static void format_deg_param(char *buf, size_t sz, float deg)
@@ -677,19 +1338,62 @@ void rotor_rs485_send_getref(void)
     send_request("GETREF", "0", Pending::GetRef);
 }
 
+void rotor_rs485_request_el_rotor_type(void)
+{
+    const uint8_t el = pwm_config_get_rotor_el_id();
+    if (el == 0u || el == pwm_config_get_rotor_id()) {
+        return;
+    }
+    if (s_el_rotor_type_known) {
+        return;
+    }
+    if (s_pending != Pending::None) {
+        return;
+    }
+    if (s_el_status_boot_pending || boot_param_chain_active() || s_status_boot_pending) {
+        return;
+    }
+    if (!bus_send_allowed_by_fault()) {
+        return;
+    }
+    /* Explizit an EL-ID — auch wenn aktuelle Achse AZ ist (Nachziehen nach Boot). */
+    send_line_to(el, "GETROTORTYPE", "0");
+    s_getposdg_dst = 0;
+    set_pending(Pending::GetRotorType);
+}
+
 void rotor_rs485_send_setref_homing(void)
 {
-    /* Laufende Positions-Telegramme abbrechen, sonst blockiert pending == SetPosDg den Homing-Start */
-    if (s_pending == Pending::SetPosDg || s_pending == Pending::GetPosDg) {
-        clear_pending();
+    /* Laufende Positions-Telegramme abbrechen, sonst blockiert pending == SetPosDg den Homing-Start.
+     * Bei Fehler (Quittung per Homing) jedes Pending verwerfen — SETREF muss raus. */
+    const bool force_for_err = (rotor_error_app_get_error_code() != 0);
+    if (s_pending == Pending::SetPosDg || s_pending == Pending::GetPosDg || force_for_err) {
+        if (s_pending != Pending::None) {
+            clear_pending();
+        }
         s_poll_pos = false;
         s_pos_grace_end_ms = 0;
         s_hw_snap_retarget_active = false;
         s_setposdg_retry_count = 0;
+        s_resume_poll_pos_after_conn_loss = false;
     } else if (s_pending != Pending::None) {
+        s_setref_queued = true;
         return;
     }
-    send_request("SETREF", "1", Pending::SetRef);
+    s_setref_queued = false;
+    /* SETREF quittiert jeden Fehler am Rotor — lokal sofort freigeben. */
+    if (rotor_error_app_get_error_code() != 0) {
+        rotor_error_app_report_rotor_err(0);
+    }
+    /* Absolutencoder (Typ ≠ 1/2): Fehler nur mit SETREF:0 quittieren.
+     * Ohne Endschalter würde SETREF:1 die aktuelle Lage als Nullpunkt setzen — ebenfalls nur quittieren. */
+    if (axis_is_absolute_encoder() || !rotor_rs485_axis_has_endstop()) {
+        s_setref_param = "0";
+        send_request("SETREF", s_setref_param, Pending::SetRef);
+        return;
+    }
+    s_setref_param = "1";
+    send_request("SETREF", s_setref_param, Pending::SetRef);
     s_poll_ref = true;
     s_request_pos_after_homing = true;
     s_homing_wait_unref_seen = true;
@@ -715,6 +1419,9 @@ bool rotor_rs485_send_stop(void)
     s_homing_wait_unref_seen = false;
     s_remote_setpos_motion = false;
     s_remote_setpos_grace_end_ms = 0;
+    clear_remote_other_motion();
+    s_resume_poll_pos_after_conn_loss = false;
+    s_resume_remote_setpos_after_conn_loss = false;
     send_request("STOP", "0", Pending::Stop);
     return true;
 }
@@ -732,9 +1439,13 @@ void rotor_rs485_send_setaselect(uint8_t antenna_1_to_3)
     if (antenna_1_to_3 < 1u || antenna_1_to_3 > 3u) {
         return;
     }
+    const uint8_t az = pwm_config_get_rotor_id();
+    if (az == 0u) {
+        return;
+    }
     char p[8];
     snprintf(p, sizeof(p), "%u", (unsigned)antenna_1_to_3);
-    send_line_to(ROTOR_RS485_BROADCAST_ID, "SETASELECT", p);
+    send_line_to(az, "SETASELECT", p);
 }
 
 bool rotor_rs485_send_set_pwm_limit(uint8_t pct)
@@ -750,10 +1461,10 @@ bool rotor_rs485_send_set_pwm_limit(uint8_t pct)
         s_pending == Pending::GetWindDir || s_pending == Pending::GetTempM) {
         clear_pending();
     }
-    if (s_pending == Pending::GetAntOff1 || s_pending == Pending::GetAntOff2 ||
-        s_pending == Pending::GetAntOff3) {
-        clear_pending();
-        abort_antenna_boot();
+    /* Boot-Param-Kette (ANTOFF/ANTDP/ANGLE/…) nicht abbrechen — sonst fehlen Dipol/Öffnungswinkel für den LED-Ring.
+     * SETPWM später erneut versuchen (Caller deferred). */
+    if (boot_param_chain_active() || s_enc_boot_pending || s_name_boot_pending) {
+        return false;
     }
     if (s_pending != Pending::None) {
         return false;
@@ -771,6 +1482,10 @@ bool rotor_rs485_goto_degrees(float deg)
     if (!s_slave_referenced) {
         return false;
     }
+    /* Boot-Param-Kette nicht killen (Dipol/Öffnungswinkel für LED-Ring). */
+    if (boot_param_chain_active() || s_enc_boot_pending || s_name_boot_pending) {
+        return false;
+    }
     /* SETPOSDG hat Vorrang: ausstehende Abfragen sofort abbrechen, damit Encoder-Ziel ohne
      * GETREF/GETERR/Weather-Wartekette direkt gesendet wird. */
     if (s_pending == Pending::SetPosDg) {
@@ -779,18 +1494,10 @@ bool rotor_rs485_goto_degrees(float deg)
     if (s_pending == Pending::SetRef || s_pending == Pending::Stop) {
         return false;
     }
-    if (s_pending == Pending::GetAntOff1 || s_pending == Pending::GetAntOff2 ||
-        s_pending == Pending::GetAntOff3) {
-        clear_pending();
-        abort_antenna_boot();
-    } else if (s_pending == Pending::GetAngle1 || s_pending == Pending::GetAngle2 ||
-               s_pending == Pending::GetAngle3) {
-        clear_pending();
-        abort_angle_boot();
-    } else if (s_pending != Pending::None) {
+    if (s_pending != Pending::None) {
         clear_pending();
     }
-    float n = normalize_deg_0_360(deg);
+    float n = normalize_deg_span(deg);
     char p[40];
     format_deg_param(p, sizeof(p), n);
     s_target_deg = n;
@@ -799,6 +1506,10 @@ bool rotor_rs485_goto_degrees(float deg)
     s_poll_pos = true;
     s_pos_grace_end_ms = 0;
     s_next_pos_poll_ms = 0;
+    s_resume_poll_pos_after_conn_loss = false;
+    /* Soft-Master: eigenes SETPOSDG beendet den Mitläufer-Deadman sofort, damit GETPOSDG
+     * nach ACK nicht ~3 s blockiert bleibt. */
+    s_last_foreign_master_to_slave_ms = 0;
     send_request("SETPOSDG", p, Pending::SetPosDg);
     /* Callback: Bus-Ist/Soll (normalisiert), UI rechnet Antennenversatz um */
     notify_target(n);
@@ -815,9 +1526,14 @@ static void try_flush_setposcc(void)
     char p[64];
     // SETPOSCC-Payload: "<deg>;<rotor_id>" damit der fremde Master den richtigen Rotor zuordnen kann.
     snprintf(p, sizeof(p), "%s;%u", deg_buf, (unsigned)s_slave_id);
-    /* DST = eingestellte Rotor-ID: Slave ignoriert/NAK, andere Bus-Clients ordnen eindeutig zu. */
-    send_line_to(s_slave_id, "SETPOSCC", p);
+    /* Mitläufer: SETPOSCC an PC-Master. Remote USB / lokaler Master: an Rotor-Slave (Proxy). */
+    uint8_t dst = s_slave_id;
+    if (!serial_bridge::remote_usb_active() && foreign_master_target_active()) {
+        dst = s_foreign_master_src_id;
+    }
+    send_line_to(dst, "SETPOSCC", p);
     s_setposcc_queued = false;
+    s_last_setposcc_tx_ms = millis();
 }
 
 void rotor_rs485_send_setposcc_degrees(float deg)
@@ -825,8 +1541,15 @@ void rotor_rs485_send_setposcc_degrees(float deg)
     if (!bus_send_allowed_by_fault()) {
         return;
     }
-    s_setposcc_queued_deg = normalize_deg_0_360(deg);
+    s_setposcc_queued_deg = normalize_deg_span(deg);
     s_setposcc_queued = true;
+}
+
+void rotor_rs485_arm_conn_watchdog(void)
+{
+    if (s_have_slave_rx_ever) {
+        s_last_slave_rx_ms = millis();
+    }
 }
 
 static void try_hw_snap_retarget(void)
@@ -850,6 +1573,11 @@ void rotor_rs485_hw_snap_retarget_request(float deg)
 
 static void notify_ref(bool ref_ok)
 {
+    if (s_el_status_boot_pending) {
+        s_slave_referenced = ref_ok;
+        s_el_boot_ref = ref_ok;
+        return;
+    }
     const bool changed = (s_slave_referenced != ref_ok);
     s_slave_referenced = ref_ok;
     /* ACK_GETREF kommt waehrend Homing sehr haeufig. LVGL-Updates nur bei
@@ -860,10 +1588,26 @@ static void notify_ref(bool ref_ok)
     }
 }
 
+void rotor_rs485_seed_referenced(bool referenced)
+{
+    /* Achsen-Cache der App beim Umschalten: UI sofort korrekt, Bestätigung folgt per GETREF. */
+    if (s_el_status_boot_pending) {
+        return;
+    }
+    notify_ref(referenced);
+}
+
+bool rotor_rs485_is_ref_state_known(void) { return s_ref_state_known; }
+
 static void notify_pos(float deg)
 {
     /* Ohne Referenz liefert GETPOSDG oft 0° o. Ä. — PC-Polling würde Ist-Anzeige/Arc falsch treiben. */
     if (!s_slave_referenced) {
+        return;
+    }
+    if (s_el_status_boot_pending) {
+        s_el_boot_pos = deg;
+        s_el_boot_have_pos = true;
         return;
     }
     s_last_pos_ui_deg = deg;
@@ -890,9 +1634,17 @@ static void flush_deferred_ref_ui(void)
 
 static void notify_target(float deg)
 {
-    if (s_target_cb) {
-        s_target_cb(deg);
+    s_target_ui_deg = deg;
+    s_target_ui_deferred = true;
+}
+
+static void flush_deferred_target_ui(void)
+{
+    if (!s_target_ui_deferred || !s_target_cb) {
+        return;
     }
+    s_target_ui_deferred = false;
+    s_target_cb(s_target_ui_deg);
 }
 
 /** Erster Zahlenwert im PARAMS nach ACK-Tag (bis zum nächsten ':') */
@@ -931,6 +1683,10 @@ static bool parse_ack_getanemo(const char *line)
     }
     s_last_wind_kmh = v;
     s_weather_dirty_mask |= 1u;
+    if (s_status_boot_pending && s_status_boot_phase == 5) {
+        s_status_boot_phase = 6;
+        send_request("GETWINDDIR", "0", Pending::GetWindDir);
+    }
     return true;
 }
 
@@ -945,6 +1701,10 @@ static bool parse_ack_gettempa(const char *line)
     }
     s_last_tempa_c = v;
     s_weather_dirty_mask |= 2u;
+    if (s_status_boot_pending && s_status_boot_phase == 3) {
+        s_status_boot_phase = 4;
+        send_request("GETTEMPM", "0", Pending::GetTempM);
+    }
     return true;
 }
 
@@ -960,6 +1720,9 @@ static bool parse_ack_winddir(const char *line)
     }
     s_last_wind_dir_deg = normalize_deg_0_360(v);
     s_weather_dirty_mask |= 4u;
+    if (s_status_boot_pending && s_status_boot_phase == 6) {
+        status_boot_finished_start_el();
+    }
     return true;
 }
 
@@ -974,6 +1737,14 @@ static bool parse_ack_gettempm(const char *line)
     }
     s_last_tempm_c = v;
     s_weather_dirty_mask |= 8u;
+    if (s_status_boot_pending && s_status_boot_phase == 4) {
+        if (pwm_config_get_anemometer() != 0) {
+            s_status_boot_phase = 5;
+            send_request("GETANEMO", "0", Pending::GetAnemo);
+        } else {
+            status_boot_finished_start_el();
+        }
+    }
     return true;
 }
 
@@ -1006,6 +1777,24 @@ static bool parse_setaselect_antenna_1_to_3(const char *line, unsigned *out_v)
         return false;
     }
     *out_v = v;
+    return true;
+}
+
+/** true wenn SETASELECT an AZ/Broadcast und Antenne gültig — dann queue_remote. */
+static bool try_queue_setaselect_from_bus(const char *line, unsigned dst, unsigned src)
+{
+    if (!setaselect_dst_is_az_or_broadcast(dst)) {
+        return false;
+    }
+    unsigned v = 0;
+    if (!parse_setaselect_antenna_1_to_3(line, &v)) {
+        return false;
+    }
+    if (src != (unsigned)s_master_id) {
+        note_foreign_master_to_rotor(src);
+    }
+    const uint8_t prev = pwm_config_get_last_antenna();
+    queue_remote_antenna_apply(prev, (uint8_t)v);
     return true;
 }
 
@@ -1049,7 +1838,7 @@ static bool parse_setposdg_command_deg(const char *line, float *out_deg)
     if (n == 0) {
         return false;
     }
-    *out_deg = normalize_deg_0_360(strtof(tmp, nullptr));
+    *out_deg = normalize_deg_span(strtof(tmp, nullptr));
     return true;
 }
 
@@ -1124,6 +1913,36 @@ static void sniff_setantoff_to_slave(const char *line)
     }
 }
 
+/** Fremd-Master: SETANTDPn an Slave — Dipol-Flag übernehmen */
+static void sniff_setantdp_to_slave(const char *line)
+{
+    static const struct {
+        const char *tag;
+        int idx;
+    } tags[] = {
+        {":SETANTDP1:", 1},
+        {":SETANTDP2:", 2},
+        {":SETANTDP3:", 3},
+    };
+    for (size_t i = 0; i < 3; i++) {
+        const char *p = strstr(line, tags[i].tag);
+        if (!p) {
+            continue;
+        }
+        p += strlen(tags[i].tag);
+        char tmp[16];
+        size_t n = 0;
+        while (*p && *p != ':' && *p != '$' && n + 1 < sizeof(tmp)) {
+            tmp[n++] = *p;
+            p++;
+        }
+        tmp[n] = '\0';
+        pwm_config_set_antdp(tags[i].idx, (uint8_t)(atoi(tmp) != 0));
+        s_pending_antenna_offset_notify = true;
+        return;
+    }
+}
+
 /** Fremd-Master: SETANGLEn an Slave — Öffnungswinkel übernehmen */
 static void sniff_setangle_to_slave(const char *line)
 {
@@ -1152,6 +1971,36 @@ static void sniff_setangle_to_slave(const char *line)
         if (v == v) {
             pwm_config_set_opening_deg(tags[i].idx, v);
         }
+        return;
+    }
+}
+
+/** Fremd-Master: SETANTNAMEn an Slave — Antennenname übernehmen (Quelle = Rotor). */
+static void sniff_setantname_to_slave(const char *line)
+{
+    static const struct {
+        const char *tag;
+        int idx;
+    } tags[] = {
+        {":SETANTNAME1:", 1},
+        {":SETANTNAME2:", 2},
+        {":SETANTNAME3:", 3},
+    };
+    for (size_t i = 0; i < 3; i++) {
+        const char *p = strstr(line, tags[i].tag);
+        if (!p) {
+            continue;
+        }
+        p += strlen(tags[i].tag);
+        char tmp[48];
+        size_t n = 0;
+        while (*p && *p != ':' && *p != '$' && n + 1 < sizeof(tmp)) {
+            tmp[n++] = *p;
+            p++;
+        }
+        tmp[n] = '\0';
+        pwm_config_set_antenna_label(tags[i].idx, tmp);
+        s_pending_config_changed_from_bus = true;
         return;
     }
 }
@@ -1287,30 +2136,64 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
 #define CFG_TRY_TAG(t) \
     extract_tag_params_cs(line, (t), par, sizeof(par), &cs) && config_cs_ok(src, dst, par, cs)
 
-    if (strstr(line, ":GETCONRID:") || strstr(line, ":GETTCONRID:")) {
-        const char *tag = strstr(line, ":GETTCONRID:") ? ":GETTCONRID:" : ":GETCONRID:";
-        if (!extract_tag_params_cs(line, tag, par, sizeof(par), &cs) || !config_cs_ok(src, dst, par, cs)) {
-            config_reply_nak(src, "NAK_GETCONRID", 2);
+    if (strstr(line, ":GETCOVERSION:")) {
+        if (!CFG_TRY_TAG(":GETCOVERSION:")) {
+            config_reply_nak(src, "NAK_GETCOVERSION", 2);
             return true;
         }
-        config_reply_ack_u8(src, "ACK_GETCONRID", pwm_config_get_rotor_id());
+        config_reply_ack_label(src, "ACK_GETCOVERSION", FIRMWARE_APP_VERSION);
         return true;
     }
 
-    if (strstr(line, ":SETCONRID:")) {
-        if (!CFG_TRY_TAG(":SETCONRID:")) {
-            config_reply_nak(src, "NAK_SETCONRID", 2);
+    if (strstr(line, ":GETCONTAZID:")) {
+        if (!CFG_TRY_TAG(":GETCONTAZID:")) {
+            config_reply_nak(src, "NAK_GETCONTAZID", 2);
+            return true;
+        }
+        config_reply_ack_u8(src, "ACK_GETCONTAZID", pwm_config_get_rotor_id());
+        return true;
+    }
+
+    if (strstr(line, ":SETCONTAZID:")) {
+        if (!CFG_TRY_TAG(":SETCONTAZID:")) {
+            config_reply_nak(src, "NAK_SETCONTAZID", 2);
             return true;
         }
         unsigned v = 0;
-        if (sscanf(par, "%u", &v) != 1 || v < 1u || v > 254u) {
-            config_reply_nak(src, "NAK_SETCONRID", 1);
+        if (sscanf(par, "%u", &v) != 1 || v > 254u) {
+            config_reply_nak(src, "NAK_SETCONTAZID", 1);
             return true;
         }
         pwm_config_set_rotor_id((uint8_t)v);
         schedule_pwm_config_save_from_bus();
         s_pending_config_changed_from_bus = true;
-        config_reply_ack_u8(src, "ACK_SETCONRID", (uint8_t)v);
+        config_reply_ack_u8(src, "ACK_SETCONTAZID", (uint8_t)v);
+        return true;
+    }
+
+    if (strstr(line, ":GETCONTELID:")) {
+        if (!CFG_TRY_TAG(":GETCONTELID:")) {
+            config_reply_nak(src, "NAK_GETCONTELID", 2);
+            return true;
+        }
+        config_reply_ack_u8(src, "ACK_GETCONTELID", pwm_config_get_rotor_el_id());
+        return true;
+    }
+
+    if (strstr(line, ":SETCONTELID:")) {
+        if (!CFG_TRY_TAG(":SETCONTELID:")) {
+            config_reply_nak(src, "NAK_SETCONTELID", 2);
+            return true;
+        }
+        unsigned v = 0;
+        if (sscanf(par, "%u", &v) != 1 || v > 254u) {
+            config_reply_nak(src, "NAK_SETCONTELID", 1);
+            return true;
+        }
+        pwm_config_set_rotor_el_id((uint8_t)v);
+        schedule_pwm_config_save_from_bus();
+        s_pending_config_changed_from_bus = true;
+        config_reply_ack_u8(src, "ACK_SETCONTELID", (uint8_t)v);
         return true;
     }
 
@@ -1412,7 +2295,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_touch_beep_freq_hz((uint16_t)v);
-        schedule_pwm_config_save_from_bus();
+        schedule_pwm_config_save_from_bus_now();
         config_reply_ack_u16(src, "ACK_SETCONFRQ", pwm_config_get_touch_beep_freq_hz());
         return true;
     }
@@ -1437,7 +2320,7 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
             return true;
         }
         pwm_config_set_touch_beep_vol((uint8_t)v);
-        schedule_pwm_config_save_from_bus();
+        schedule_pwm_config_save_from_bus_now();
         config_reply_ack_u8(src, "ACK_SETLSL", pwm_config_get_touch_beep_vol());
         return true;
     }
@@ -1465,6 +2348,72 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
         schedule_pwm_config_save_from_bus();
         s_pending_config_changed_from_bus = true;
         config_reply_ack_u8(src, "ACK_SETCONANO", pwm_config_get_anemometer());
+        return true;
+    }
+
+    if (strstr(line, ":GETCONREMOTE:")) {
+        if (!CFG_TRY_TAG(":GETCONREMOTE:")) {
+            config_reply_nak(src, "NAK_GETCONREMOTE", 2);
+            return true;
+        }
+        config_reply_ack_u8(src, "ACK_GETCONREMOTE", pwm_config_get_remote_usb());
+        return true;
+    }
+
+    if (strstr(line, ":SETCONREMOTE:")) {
+        if (!CFG_TRY_TAG(":SETCONREMOTE:")) {
+            config_reply_nak(src, "NAK_SETCONREMOTE", 2);
+            return true;
+        }
+        unsigned v = 0;
+        if (sscanf(par, "%u", &v) != 1 || v > 1u) {
+            config_reply_nak(src, "NAK_SETCONREMOTE", 1);
+            return true;
+        }
+        const uint8_t prev = pwm_config_get_remote_usb();
+        pwm_config_set_remote_usb((uint8_t)v);
+        /* Sofort speichern — sonst geht remote_usb bei Reset/Flash verloren. */
+        schedule_pwm_config_save_from_bus_now();
+        s_pending_config_changed_from_bus = true;
+        /* ACK immer noch auf dem bisherigen Transport (USB oder RS485), danach umschalten.
+         * Sonst: SETCONREMOTE:1 per Bus → ACK nur noch USB (PC hört Bus) / umgekehrt. */
+        config_reply_ack_u8(src, "ACK_SETCONREMOTE", (uint8_t)v);
+        serial_bridge::set_remote_usb(v != 0u);
+        if (prev != (uint8_t)v) {
+            rotor_rs485_relink();
+        }
+        return true;
+    }
+
+    if (strstr(line, ":GETLINKMODE:")) {
+        if (!CFG_TRY_TAG(":GETLINKMODE:")) {
+            config_reply_nak(src, "NAK_GETLINKMODE", 2);
+            return true;
+        }
+        config_reply_ack_u8(src, "ACK_GETLINKMODE", pwm_config_get_link_mode());
+        return true;
+    }
+
+    if (strstr(line, ":SETLINKMODE:")) {
+        if (!CFG_TRY_TAG(":SETLINKMODE:")) {
+            config_reply_nak(src, "NAK_SETLINKMODE", 2);
+            return true;
+        }
+        unsigned v = 0;
+        if (sscanf(par, "%u", &v) != 1 || v > 2u) {
+            config_reply_nak(src, "NAK_SETLINKMODE", 1);
+            return true;
+        }
+        const uint8_t prev_remote = pwm_config_get_remote_usb();
+        pwm_config_set_link_mode((uint8_t)v);
+        schedule_pwm_config_save_from_bus_now();
+        s_pending_config_changed_from_bus = true;
+        config_reply_ack_u8(src, "ACK_SETLINKMODE", (uint8_t)v);
+        const uint8_t rem = pwm_config_get_remote_usb();
+        serial_bridge::set_remote_usb(rem != 0u);
+        if (prev_remote != rem) {
+            rotor_rs485_relink();
+        }
         return true;
     }
 
@@ -1546,6 +2495,16 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
         return true;
     }
 
+    /* #<PC>:<cont_id>:GETASELECT:0:CS$ → ACK_GETASELECT:<1|2|3> */
+    if (strstr(line, ":GETASELECT:")) {
+        if (!CFG_TRY_TAG(":GETASELECT:")) {
+            config_reply_nak(src, "NAK_GETASELECT", 2);
+            return true;
+        }
+        config_reply_ack_u8(src, "ACK_GETASELECT", pwm_config_get_last_antenna());
+        return true;
+    }
+
     static const struct {
         const char *get_tag;
         const char *set_tag;
@@ -1584,6 +2543,12 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
                 return true;
             }
             pwm_config_set_antenna_label(ant[i].idx, par);
+            /* Namen leben am Rotor: SETCONANTNAME zusätzlich als SETANTNAME an den Slave. */
+            {
+                char cmd[16];
+                snprintf(cmd, sizeof(cmd), "SETANTNAME%d", ant[i].idx);
+                send_line_to(s_slave_id, cmd, par);
+            }
             schedule_pwm_config_save_from_bus();
             s_pending_config_changed_from_bus = true;
             config_reply_ack_label(src, ant[i].ack_set, pwm_config_get_antenna_label(ant[i].idx));
@@ -1597,26 +2562,24 @@ static bool handle_local_config_command(const char *line, unsigned src, unsigned
 
 static void dispatch_bus_command_to_slave(const char *line, unsigned src)
 {
-    /* SETASELECT oft als #SRC:SlaveID:SETASELECT:n:CS$ (nicht nur Broadcast 255) — sonst sieht der Controller
-     * den Antennenwechsel von der PC-Software während der Fahrt nicht. */
-    {
-        unsigned ant = 0;
-        if (parse_setaselect_antenna_1_to_3(line, &ant)) {
-            const uint8_t prev = pwm_config_get_last_antenna();
-            queue_remote_antenna_apply(prev, (uint8_t)ant);
-            return;
-        }
+    /* SETASELECT an AZ (oder wenn AZ aktiv): UI/Cache nachziehen — Speichern macht der AZ-Rotor. */
+    if (try_queue_setaselect_from_bus(line, (unsigned)s_slave_id, src)) {
+        return;
     }
 
-    /* PC-Client (anderer Master): SETREF:1 → gleiche Homing-Flags wie rotor_rs485_send_setref_homing()
-     * (LED, Meldetext „Referenziere“, NeoPixel-Lauflicht, GETREF bis referenziert). */
+    /* PC-Client (anderer Master): SETREF → Fehler quittieren; SETREF:1 → Homing-Flags. */
     if (src != (unsigned)s_master_id) {
         int ref_cmd = 0;
-        if (parse_setref_command_param(line, &ref_cmd) && ref_cmd != 0) {
-            s_poll_ref = true;
-            s_request_pos_after_homing = true;
-            s_homing_wait_unref_seen = true;
-            s_next_ref_poll_ms = millis() + ROTOR_POLL_GAP_MS;
+        if (parse_setref_command_param(line, &ref_cmd)) {
+            if (rotor_error_app_get_error_code() != 0) {
+                rotor_error_app_report_rotor_err(0);
+            }
+            if (ref_cmd != 0) {
+                s_poll_ref = true;
+                s_request_pos_after_homing = true;
+                s_homing_wait_unref_seen = true;
+                s_next_ref_poll_ms = millis() + ROTOR_POLL_GAP_MS;
+            }
         }
     }
 
@@ -1634,7 +2597,140 @@ static void dispatch_bus_command_to_slave(const char *line, unsigned src)
         }
     }
     sniff_setantoff_to_slave(line);
+    sniff_setantdp_to_slave(line);
     sniff_setangle_to_slave(line);
+    sniff_setantname_to_slave(line);
+}
+
+/**
+ * Mitläufer: Befehl an die inaktive Achse — Cache/Soll mitschneiden, aktive UI nicht überschreiben.
+ * Homing-Polling (s_poll_ref) gilt nur für die aktive Slave-ID.
+ */
+static void dispatch_bus_command_to_inactive_slave(const char *line, unsigned src, unsigned dst)
+{
+    /* SETASELECT an AZ während EL aktiv (oder umgekehrt inaktiv): mitschneiden. */
+    if (try_queue_setaselect_from_bus(line, dst, src)) {
+        return;
+    }
+
+    if (src == (unsigned)s_master_id) {
+        return;
+    }
+
+    const uint8_t axis = axis_index_for_slave_id(dst);
+
+    int ref_cmd = 0;
+    if (parse_setref_command_param(line, &ref_cmd) && ref_cmd != 0) {
+        rotor_app_seed_axis_referenced(axis, false);
+        return;
+    }
+
+    float deg = 0.0f;
+    if (parse_setposdg_command_deg(line, &deg)) {
+        if (axis == 1u) {
+            const float el_max = pwm_config_get_el_max_deg();
+            if (deg < 0.0f) {
+                deg = 0.0f;
+            } else if (deg > el_max) {
+                deg = el_max;
+            }
+        } else {
+            deg = normalize_deg_span(deg);
+        }
+        s_remote_other_motion = true;
+        s_remote_other_slave_id = (uint8_t)dst;
+        s_remote_other_target_deg = deg;
+        s_remote_other_grace_end_ms = 0;
+        rotor_app_seed_axis_target_bus(axis, deg);
+    }
+}
+
+/** Mitläufer: ACK der inaktiven Achse → App-Cache (Ist/Ref), ohne aktive UI. */
+static bool listen_inactive_slave_ack(const char *line, unsigned src)
+{
+    if (!is_inactive_rotor_slave(src)) {
+        return false;
+    }
+    (void)parse_axis_enctype_reply(line);
+    /* GETASELECT / ANTOFF/ANTDP/ANGLE/…-ACK vom AZ während EL aktiv (Boot an AZ-ID). */
+    if (src == (unsigned)pwm_config_get_rotor_id() && boot_param_chain_active()) {
+        if (parse_ack_getaselect(line) || parse_ack_getantoff1(line) || parse_ack_getantoff2(line) ||
+            parse_ack_getantoff3(line) || parse_ack_getantdp1(line) || parse_ack_getantdp2(line) ||
+            parse_ack_getantdp3(line) || parse_ack_getangle1(line) || parse_ack_getangle2(line) ||
+            parse_ack_getangle3(line) || parse_ack_getenctype(line) || parse_ack_getmaxdg(line) ||
+            parse_ack_getantname1(line) || parse_ack_getantname2(line) || parse_ack_getantname3(line)) {
+            return true;
+        }
+    }
+    const uint8_t axis = axis_index_for_slave_id(src);
+
+    if (parse_endstc_reply(line)) {
+        return true;
+    }
+
+    if (strstr(line, ":ACK_GETREF:")) {
+        const char *p = strstr(line, ":ACK_GETREF:");
+        p += strlen(":ACK_GETREF:");
+        char valbuf[24];
+        size_t i = 0;
+        while (*p && *p != ':' && i + 1 < sizeof(valbuf)) {
+            valbuf[i++] = (*p == ',') ? '.' : *p;
+            p++;
+        }
+        valbuf[i] = '\0';
+        const bool ref_ok = ((int)(strtof(valbuf, nullptr) + 0.5f) != 0);
+        rotor_app_seed_axis_referenced(axis, ref_ok);
+        return true;
+    }
+
+    if (strstr(line, ":ACK_GETROTORTYPE:") || strstr(line, ":ACK_ROTORTYPE:")) {
+        /* Typ auch mitschneiden, wenn Antwort nach Achsenwechsel / verzögert kommt. */
+        (void)parse_ack_getrotortype(line);
+        return true;
+    }
+
+    if (strstr(line, ":ACK_GETPOSDG:")) {
+        const char *p = strstr(line, ":ACK_GETPOSDG:");
+        p += strlen(":ACK_GETPOSDG:");
+        char valbuf[32];
+        size_t i = 0;
+        while (*p && *p != ':' && i + 1 < sizeof(valbuf)) {
+            valbuf[i++] = (*p == ',') ? '.' : *p;
+            p++;
+        }
+        valbuf[i] = '\0';
+        const float deg_raw = parse_rs485_deg_valbuf_to_float(valbuf);
+        float deg_ui;
+        if (axis == 1u) {
+            const float el_max = pwm_config_get_el_max_deg();
+            deg_ui = deg_raw;
+            if (deg_ui < 0.0f) {
+                deg_ui = 0.0f;
+            } else if (deg_ui > el_max) {
+                deg_ui = el_max;
+            }
+        } else {
+            const float deg = normalize_deg_span(deg_raw);
+            deg_ui = bus_deg_for_ui(deg, deg_raw, false);
+        }
+        rotor_app_seed_axis_cache(axis, deg_ui, true);
+
+        if (s_remote_other_motion && s_remote_other_slave_id == (uint8_t)src) {
+            if (linear_span_diff(deg_ui, s_remote_other_target_deg) <= ROTOR_POS_TOL_DEG) {
+                if (s_remote_other_grace_end_ms == 0) {
+                    s_remote_other_grace_end_ms = millis() + ROTOR_POLL_POS_GRACE_MS;
+                }
+                if ((int32_t)(millis() - s_remote_other_grace_end_ms) >= 0) {
+                    clear_remote_other_motion();
+                }
+            } else {
+                s_remote_other_grace_end_ms = 0;
+            }
+        }
+        return true;
+    }
+
+    return false;
 }
 
 static void on_ack_timeout()
@@ -1642,8 +2738,7 @@ static void on_ack_timeout()
     if (!pending_timed_out()) {
         return;
     }
-    /* Proxy/Fremd-Master bedient den Rotor: eigene GET-*-Pendings nie wiederholen.
-     * Im Proxy soll der Controller den Rotor nicht pollen; Ist/Ref kommen aus mitgesnifften ACKs. */
+    /* Proxy/Fremd-Master: zyklische GETs nicht wiederholen — Boot-Lesevorgänge aber schon. */
     if (rotor_rs485_is_foreign_pc_listen_mode()) {
         switch (s_pending) {
         case Pending::GetRef:
@@ -1656,12 +2751,26 @@ static void on_ack_timeout()
         case Pending::GetAntOff1:
         case Pending::GetAntOff2:
         case Pending::GetAntOff3:
+        case Pending::GetAntDp1:
+        case Pending::GetAntDp2:
+        case Pending::GetAntDp3:
         case Pending::GetAngle1:
         case Pending::GetAngle2:
         case Pending::GetAngle3:
+        case Pending::GetEncType:
+        case Pending::GetMaxDg:
+        case Pending::GetRotorType:
+        case Pending::GetAntName1:
+        case Pending::GetAntName2:
+        case Pending::GetAntName3:
+        case Pending::GetAselect:
         case Pending::Test:
-            clear_pending();
-            return;
+            if (!is_boot_read_allowed(s_pending)) {
+                clear_pending();
+                return;
+            }
+            /* Boot: Retry wie unten (try_*_boot_step holt nach clear nach; hier direkt erneut). */
+            break;
         default:
             break;
         }
@@ -1669,20 +2778,36 @@ static void on_ack_timeout()
     /* Kein clear_pending: dasselbe Telegramm erneut (Kollision / fehlendes ACK). */
     switch (s_pending) {
     case Pending::GetRef:
-        send_request("GETREF", "0", Pending::GetRef);
+        if (el_probe_on_timeout()) {
+            break;
+        }
+        if (s_el_status_boot_pending) {
+            send_line_to(pwm_config_get_rotor_el_id(), "GETREF", "0");
+            set_pending(Pending::GetRef);
+        } else {
+            send_request("GETREF", "0", Pending::GetRef);
+        }
         break;
     case Pending::GetPosDg:
-        send_request("GETPOSDG", "0", Pending::GetPosDg);
+        if (el_probe_on_timeout()) {
+            break;
+        }
+        send_getposdg_to(s_getposdg_dst ? s_getposdg_dst : s_slave_id);
         break;
     case Pending::SetPosDg: {
         if (s_setposdg_retry_count < ROTOR_RS485_SETPOSDG_MAX_RETRIES) {
             char p[40];
-            format_deg_param(p, sizeof(p), normalize_deg_0_360(s_goto_commanded_deg));
+            format_deg_param(p, sizeof(p), normalize_deg_span(s_goto_commanded_deg));
             send_request("SETPOSDG", p, Pending::SetPosDg);
             s_setposdg_retry_count++;
         } else {
-            /* Nach max. Retry nicht in SetPosDg-Pending haengen bleiben:
-             * sonst blockiert ein verlorenes ACK dauerhaft alle weiteren Encoder-SETPOSDG. */
+            /* Nach max. Retry Pending aufgeben — Watchdog-Uhr neu starten:
+             * Wenn pending auf None wechselt, fällt conn_timeout_ms von
+             * ROTOR_CONN_LOST_TIMEOUT_SETPOSDG_MS auf ROTOR_CONN_LOST_TIMEOUT_MS.
+             * Liegt s_last_slave_rx_ms schon ~2400 ms zurück (= SETPOSDG-Retry-Dauer),
+             * löst der Watchdog sonst innerhalb von ~400 ms Fehler 10 aus, obwohl
+             * der Bus weiter aktiv ist (der Slave fährt noch). */
+            s_last_slave_rx_ms = millis();
             clear_pending();
             s_poll_pos = false;
             s_pos_grace_end_ms = 0;
@@ -1690,8 +2815,34 @@ static void on_ack_timeout()
         break;
     }
     case Pending::SetRef:
-        send_request("SETREF", "1", Pending::SetRef);
+        send_request("SETREF", s_setref_param, Pending::SetRef);
         break;
+    case Pending::GetEndStc: {
+        const uint8_t axis = axis_index_for_slave_id(s_slave_id);
+        if (++s_endstc_timeout_count >= ROTOR_ENDSTC_MAX_TIMEOUTS) {
+            /* Keine Antwort: Default (Endschalter vorhanden) für diese ID festhalten. */
+            clear_pending();
+            s_endstc_learned_id[axis] = configured_slave_id_for_axis(axis);
+            s_axis_has_endstop[axis] = true;
+            s_endstc_timeout_count = 0;
+        } else {
+            send_request("GETENDSTC", "0", Pending::GetEndStc);
+        }
+        break;
+    }
+    case Pending::GetAxisEncType: {
+        const uint8_t axis = axis_index_for_slave_id(s_slave_id);
+        if (++s_axis_enctype_timeout_count >= ROTOR_ENDSTC_MAX_TIMEOUTS) {
+            /* Keine Antwort: unbekannt lassen (= Verhalten wie bisher), nicht erneut fragen. */
+            clear_pending();
+            s_enctype_learned_id[axis] = configured_slave_id_for_axis(axis);
+            s_axis_enc_type[axis] = 0u;
+            s_axis_enctype_timeout_count = 0;
+        } else {
+            send_request("GETENCTYPE", "0", Pending::GetAxisEncType);
+        }
+        break;
+    }
     case Pending::Stop:
         send_request("STOP", "0", Pending::Stop);
         break;
@@ -1711,23 +2862,162 @@ static void on_ack_timeout()
         break;
     }
     case Pending::GetAntOff1:
-        send_request("GETANTOFF1", "1", Pending::GetAntOff1);
+        if (boot_param_timeouts_exhausted()) {
+            clear_pending();
+            if (s_antenna_boot_pending && s_antenna_boot_phase == 1) {
+                s_antenna_boot_phase = 2;
+                send_az_boot_request("GETANTOFF2", "1", Pending::GetAntOff2);
+            }
+        } else {
+            send_az_boot_request("GETANTOFF1", "1", Pending::GetAntOff1);
+        }
         break;
     case Pending::GetAntOff2:
-        send_request("GETANTOFF2", "1", Pending::GetAntOff2);
+        if (boot_param_timeouts_exhausted()) {
+            clear_pending();
+            if (s_antenna_boot_pending && s_antenna_boot_phase == 2) {
+                s_antenna_boot_phase = 3;
+                send_az_boot_request("GETANTOFF3", "1", Pending::GetAntOff3);
+            }
+        } else {
+            send_az_boot_request("GETANTOFF2", "1", Pending::GetAntOff2);
+        }
         break;
     case Pending::GetAntOff3:
-        send_request("GETANTOFF3", "1", Pending::GetAntOff3);
+        if (boot_param_timeouts_exhausted()) {
+            clear_pending();
+            if (s_antenna_boot_pending && s_antenna_boot_phase == 3) {
+                s_antenna_boot_phase = 4;
+                send_az_boot_request("GETANTDP1", "1", Pending::GetAntDp1);
+            }
+        } else {
+            send_az_boot_request("GETANTOFF3", "1", Pending::GetAntOff3);
+        }
+        break;
+    case Pending::GetAntDp1:
+        if (boot_param_timeouts_exhausted()) {
+            clear_pending();
+            if (s_antenna_boot_pending && s_antenna_boot_phase == 4) {
+                s_antenna_boot_phase = 5;
+                send_az_boot_request("GETANTDP2", "1", Pending::GetAntDp2);
+            }
+        } else {
+            send_az_boot_request("GETANTDP1", "1", Pending::GetAntDp1);
+        }
+        break;
+    case Pending::GetAntDp2:
+        if (boot_param_timeouts_exhausted()) {
+            clear_pending();
+            if (s_antenna_boot_pending && s_antenna_boot_phase == 5) {
+                s_antenna_boot_phase = 6;
+                send_az_boot_request("GETANTDP3", "1", Pending::GetAntDp3);
+            }
+        } else {
+            send_az_boot_request("GETANTDP2", "1", Pending::GetAntDp2);
+        }
+        break;
+    case Pending::GetAntDp3:
+        if (boot_param_timeouts_exhausted()) {
+            clear_pending();
+            if (s_antenna_boot_pending && s_antenna_boot_phase == 6) {
+                s_antenna_boot_pending = false;
+                s_antenna_boot_phase = 0;
+                s_angle_boot_pending = true;
+                s_angle_boot_phase = 1;
+                send_az_boot_request("GETANGLE1", "1", Pending::GetAngle1);
+            }
+        } else {
+            send_az_boot_request("GETANTDP3", "1", Pending::GetAntDp3);
+        }
         break;
     case Pending::GetAngle1:
-        send_request("GETANGLE1", "1", Pending::GetAngle1);
+        if (boot_param_timeouts_exhausted()) {
+            clear_pending();
+            if (s_angle_boot_pending && s_angle_boot_phase == 1) {
+                s_angle_boot_phase = 2;
+                send_az_boot_request("GETANGLE2", "1", Pending::GetAngle2);
+            }
+        } else {
+            send_az_boot_request("GETANGLE1", "1", Pending::GetAngle1);
+        }
         break;
     case Pending::GetAngle2:
-        send_request("GETANGLE2", "1", Pending::GetAngle2);
+        if (boot_param_timeouts_exhausted()) {
+            clear_pending();
+            if (s_angle_boot_pending && s_angle_boot_phase == 2) {
+                s_angle_boot_phase = 3;
+                send_az_boot_request("GETANGLE3", "1", Pending::GetAngle3);
+            }
+        } else {
+            send_az_boot_request("GETANGLE2", "1", Pending::GetAngle2);
+        }
         break;
     case Pending::GetAngle3:
-        send_request("GETANGLE3", "1", Pending::GetAngle3);
+        if (boot_param_timeouts_exhausted()) {
+            clear_pending();
+            if (s_angle_boot_pending && s_angle_boot_phase == 3) {
+                s_angle_boot_pending = false;
+                s_angle_boot_phase = 0;
+                s_enc_boot_pending = true;
+                s_enc_boot_phase = 1;
+                send_az_boot_request("GETENCTYPE", "0", Pending::GetEncType);
+            }
+        } else {
+            send_az_boot_request("GETANGLE3", "1", Pending::GetAngle3);
+        }
         break;
+    case Pending::GetEncType:
+        send_az_boot_request("GETENCTYPE", "0", Pending::GetEncType);
+        break;
+    case Pending::GetMaxDg:
+        send_az_boot_request("GETMAXDG", "0", Pending::GetMaxDg);
+        break;
+    case Pending::GetRotorType:
+        if (s_el_status_boot_pending) {
+            if (el_probe_on_timeout()) {
+                break;
+            }
+            send_line_to(pwm_config_get_rotor_el_id(), "GETROTORTYPE", "0");
+            set_pending(Pending::GetRotorType);
+            break;
+        }
+        s_el_type_fail_count++;
+        if (s_el_type_fail_count >= ROTOR_EL_TYPE_MAX_FAILS) {
+            clear_pending();
+            s_el_rotor_type_known = true; /* Default behalten, AZ nicht blockieren */
+            break;
+        }
+        {
+            const uint8_t el = pwm_config_get_rotor_el_id();
+            if (el != 0u) {
+                send_line_to(el, "GETROTORTYPE", "0");
+                set_pending(Pending::GetRotorType);
+            } else {
+                clear_pending();
+                s_el_rotor_type_known = true;
+            }
+        }
+        break;
+    case Pending::GetAntName1:
+        send_az_boot_request("GETANTNAME1", "0", Pending::GetAntName1);
+        break;
+    case Pending::GetAntName2:
+        send_az_boot_request("GETANTNAME2", "0", Pending::GetAntName2);
+        break;
+    case Pending::GetAntName3:
+        send_az_boot_request("GETANTNAME3", "0", Pending::GetAntName3);
+        break;
+    case Pending::GetAselect: {
+        const uint8_t az = pwm_config_get_rotor_id();
+        if (az == 0u || boot_param_timeouts_exhausted()) {
+            clear_pending();
+            s_aselect_boot_pending = false;
+            boot_param_reset_timeouts();
+            break;
+        }
+        send_az_boot_request("GETASELECT", "0", Pending::GetAselect);
+        break;
+    }
     case Pending::GetAnemo:
         send_request("GETANEMO", "0", Pending::GetAnemo);
         break;
@@ -1744,9 +3034,16 @@ static void on_ack_timeout()
         s_boot_test_timeout_count++;
         if (s_boot_test_timeout_count >= 3) {
             clear_pending();
-            s_boot_test_done = true;
-            rotor_error_app_set_error_code(10);
-            stop_fault_motion_polling();
+            /* Remote USB: nie Soft-10 — Watchdog nur im RS485-Modus. */
+            if (!serial_bridge::remote_usb_active() && pwm_config_get_remote_usb() == 0u) {
+                s_boot_test_done = true;
+                rotor_error_app_set_error_code(10);
+                stop_fault_motion_polling();
+            } else {
+                /* Remote: TEST-Fail ohne Soft-10 — auf PC warten, Boot später erneut. */
+                s_boot_test_done = false;
+                s_boot_test_timeout_count = 0;
+            }
         } else {
             send_request("TEST", "0", Pending::Test);
         }
@@ -1774,6 +3071,9 @@ static bool parse_ack_setposdg_result(const char *line)
     if (for_us && s_pending == Pending::SetPosDg) {
         clear_pending();
         s_hw_snap_retarget_active = false;
+        /* Soft-Master: nach eigenem SETPOSDG sofort GETPOSDG, auch wenn kurz zuvor
+         * noch Fremd-Master-Aktivität den Mitläufer-Timer gesetzt hatte. */
+        s_last_foreign_master_to_slave_ms = 0;
     }
     if (for_us && s_poll_pos && !rotor_rs485_is_foreign_pc_listen_mode()) {
         send_request("GETPOSDG", "0", Pending::GetPosDg);
@@ -1790,10 +3090,85 @@ static bool parse_ack_setref_result(const char *line)
     if (s_pending == Pending::SetRef) {
         clear_pending();
     }
+    /* SETREF quittiert jeden Fehler am Rotor — Latch lokal mitnehmen. */
+    if (rotor_error_app_get_error_code() != 0) {
+        rotor_error_app_report_rotor_err(0);
+    }
     if (s_poll_ref) {
         s_next_ref_poll_ms = millis() + ROTOR_POLL_GAP_MS;
     }
     return true;
+}
+
+/** ACK_GETENDSTC:<0|1|2> (auch mitgehört / inaktive Achse); NAK (alte Firmware) = Endschalter vorhanden. */
+static bool parse_endstc_reply(const char *line)
+{
+    const char *ack = strstr(line, ":ACK_GETENDSTC:");
+    const bool nak = (ack == nullptr) && (strstr(line, ":NAK_GETENDSTC:") != nullptr);
+    if (!ack && !nak) {
+        return false;
+    }
+    unsigned src = 0;
+    unsigned dst = 0;
+    if (line_src_dst(line, &src, &dst)) {
+        const bool has = nak ? true : (atoi(ack + strlen(":ACK_GETENDSTC:")) != 0);
+        store_endstc_for_slave(src, has);
+    }
+    if (s_pending == Pending::GetEndStc && src == (unsigned)s_slave_id) {
+        clear_pending();
+        s_endstc_timeout_count = 0;
+    }
+    return true;
+}
+
+/** ACK_GETENCTYPE je Achse mitschreiben. true nur, wenn es die Antwort auf unser
+ * GetAxisEncType war — sonst weiter an den Boot-Parser (AZ-Encoder-Typ / GETMAXDG-Kette). */
+static bool parse_axis_enctype_reply(const char *line)
+{
+    const char *ack = strstr(line, ":ACK_GETENCTYPE:");
+    const bool nak = (ack == nullptr) && (strstr(line, ":NAK_GETENCTYPE:") != nullptr);
+    if (!ack && !nak) {
+        return false;
+    }
+    unsigned src = 0;
+    unsigned dst = 0;
+    if (!line_src_dst(line, &src, &dst)) {
+        return false;
+    }
+    if (ack) {
+        const int t = atoi(ack + strlen(":ACK_GETENCTYPE:"));
+        if (t >= 1 && t <= 255) {
+            store_enctype_for_slave(src, (uint8_t)t);
+        }
+    }
+    if (s_pending == Pending::GetAxisEncType && src == (unsigned)s_slave_id) {
+        if (nak) {
+            store_enctype_for_slave(src, 0u);
+        }
+        clear_pending();
+        s_axis_enctype_timeout_count = 0;
+        return true;
+    }
+    return false;
+}
+
+/** Nach Boot: GETENDSTC und GETENCTYPE einmal je aktiver Slave-ID (nach Achsenwechsel / ID-Änderung erneut). */
+static void try_endstc_step(void)
+{
+    if (!s_boot_done || s_slave_id == 0u || s_pending != Pending::None) {
+        return;
+    }
+    const uint8_t axis = axis_index_for_slave_id(s_slave_id);
+    if (configured_slave_id_for_axis(axis) != s_slave_id) {
+        return;
+    }
+    if (!endstc_known_for_axis(axis)) {
+        send_request("GETENDSTC", "0", Pending::GetEndStc);
+        return;
+    }
+    if (!enctype_known_for_axis(axis)) {
+        send_request("GETENCTYPE", "0", Pending::GetAxisEncType);
+    }
 }
 
 static bool parse_ack_test(const char *line)
@@ -1860,15 +3235,18 @@ static bool parse_ack_getantoff1(const char *line)
         return false;
     }
     const float v = parse_ack_antoff_value_after_tag(line, ":ACK_GETANTOFF1:");
-    if (v == v) {
+    const bool valid = (v == v);
+    if (valid) {
         pwm_config_set_antoff_deg(1, normalize_deg_0_360(v));
+        s_pending_antenna_offset_notify = true;
     }
     const bool was = (s_pending == Pending::GetAntOff1);
     if (was) {
         clear_pending();
     }
-    if (s_antenna_boot_pending && s_antenna_boot_phase == 1 && was) {
-        send_request("GETANTOFF2", "1", Pending::GetAntOff2);
+    if (s_antenna_boot_pending && s_antenna_boot_phase == 1 && valid) {
+        boot_param_reset_timeouts();
+        send_az_boot_request("GETANTOFF2", "1", Pending::GetAntOff2);
         s_antenna_boot_phase = 2;
     }
     return true;
@@ -1880,15 +3258,18 @@ static bool parse_ack_getantoff2(const char *line)
         return false;
     }
     const float v = parse_ack_antoff_value_after_tag(line, ":ACK_GETANTOFF2:");
-    if (v == v) {
+    const bool valid = (v == v);
+    if (valid) {
         pwm_config_set_antoff_deg(2, normalize_deg_0_360(v));
+        s_pending_antenna_offset_notify = true;
     }
     const bool was = (s_pending == Pending::GetAntOff2);
     if (was) {
         clear_pending();
     }
-    if (s_antenna_boot_pending && s_antenna_boot_phase == 2 && was) {
-        send_request("GETANTOFF3", "1", Pending::GetAntOff3);
+    if (s_antenna_boot_pending && s_antenna_boot_phase == 2 && valid) {
+        boot_param_reset_timeouts();
+        send_az_boot_request("GETANTOFF3", "1", Pending::GetAntOff3);
         s_antenna_boot_phase = 3;
     }
     return true;
@@ -1900,20 +3281,114 @@ static bool parse_ack_getantoff3(const char *line)
         return false;
     }
     const float v = parse_ack_antoff_value_after_tag(line, ":ACK_GETANTOFF3:");
-    if (v == v) {
+    const bool valid = (v == v);
+    if (valid) {
         pwm_config_set_antoff_deg(3, normalize_deg_0_360(v));
+        s_pending_antenna_offset_notify = true;
     }
     const bool was = (s_pending == Pending::GetAntOff3);
     if (was) {
         clear_pending();
     }
-    if (s_antenna_boot_pending && s_antenna_boot_phase == 3 && was) {
+    if (s_antenna_boot_pending && s_antenna_boot_phase == 3 && valid) {
+        boot_param_reset_timeouts();
+        s_antenna_boot_phase = 4;
+        send_az_boot_request("GETANTDP1", "1", Pending::GetAntDp1);
+    }
+    return true;
+}
+
+static bool parse_ack_antdp_flag_after_tag(const char *line, const char *ack_tag, int *out_flag)
+{
+    const char *p = strstr(line, ack_tag);
+    if (!p) {
+        return false;
+    }
+    p += strlen(ack_tag);
+    if (*p == '\0') {
+        return false;
+    }
+    char valbuf[16];
+    size_t i = 0;
+    while (*p && *p != ':' && i + 1 < sizeof(valbuf)) {
+        valbuf[i++] = *p;
+        p++;
+    }
+    valbuf[i] = '\0';
+    if (out_flag) {
+        *out_flag = (atoi(valbuf) != 0) ? 1 : 0;
+    }
+    return true;
+}
+
+static bool parse_ack_getantdp1(const char *line)
+{
+    if (!strstr(line, ":ACK_GETANTDP1:")) {
+        return false;
+    }
+    int flag = 0;
+    const bool valid = parse_ack_antdp_flag_after_tag(line, ":ACK_GETANTDP1:", &flag);
+    if (valid) {
+        pwm_config_set_antdp(1, (uint8_t)flag);
+        s_pending_antenna_offset_notify = true;
+    }
+    const bool was = (s_pending == Pending::GetAntDp1);
+    if (was) {
+        clear_pending();
+    }
+    if (s_antenna_boot_pending && s_antenna_boot_phase == 4 && valid) {
+        boot_param_reset_timeouts();
+        s_antenna_boot_phase = 5;
+        send_az_boot_request("GETANTDP2", "1", Pending::GetAntDp2);
+    }
+    return true;
+}
+
+static bool parse_ack_getantdp2(const char *line)
+{
+    if (!strstr(line, ":ACK_GETANTDP2:")) {
+        return false;
+    }
+    int flag = 0;
+    const bool valid = parse_ack_antdp_flag_after_tag(line, ":ACK_GETANTDP2:", &flag);
+    if (valid) {
+        pwm_config_set_antdp(2, (uint8_t)flag);
+        s_pending_antenna_offset_notify = true;
+    }
+    const bool was = (s_pending == Pending::GetAntDp2);
+    if (was) {
+        clear_pending();
+    }
+    if (s_antenna_boot_pending && s_antenna_boot_phase == 5 && valid) {
+        boot_param_reset_timeouts();
+        s_antenna_boot_phase = 6;
+        send_az_boot_request("GETANTDP3", "1", Pending::GetAntDp3);
+    }
+    return true;
+}
+
+static bool parse_ack_getantdp3(const char *line)
+{
+    if (!strstr(line, ":ACK_GETANTDP3:")) {
+        return false;
+    }
+    int flag = 0;
+    const bool valid = parse_ack_antdp_flag_after_tag(line, ":ACK_GETANTDP3:", &flag);
+    if (valid) {
+        pwm_config_set_antdp(3, (uint8_t)flag);
+        s_pending_antenna_offset_notify = true;
+    }
+    const bool was = (s_pending == Pending::GetAntDp3);
+    if (was) {
+        clear_pending();
+    }
+    if (s_antenna_boot_pending && s_antenna_boot_phase == 6 && valid) {
+        boot_param_reset_timeouts();
         s_antenna_boot_pending = false;
         s_antenna_boot_phase = 0;
-        s_pending_antenna_offset_notify = true;
         s_angle_boot_pending = true;
         s_angle_boot_phase = 1;
-        send_request("GETANGLE1", "1", Pending::GetAngle1);
+        send_az_boot_request("GETANGLE1", "1", Pending::GetAngle1);
     }
     return true;
 }
@@ -1932,7 +3407,8 @@ static bool parse_ack_getangle1(const char *line)
         clear_pending();
     }
     if (s_angle_boot_pending && s_angle_boot_phase == 1 && was) {
-        send_request("GETANGLE2", "1", Pending::GetAngle2);
+        boot_param_reset_timeouts();
+        send_az_boot_request("GETANGLE2", "1", Pending::GetAngle2);
         s_angle_boot_phase = 2;
     }
     return true;
@@ -1952,7 +3428,8 @@ static bool parse_ack_getangle2(const char *line)
         clear_pending();
     }
     if (s_angle_boot_pending && s_angle_boot_phase == 2 && was) {
-        send_request("GETANGLE3", "1", Pending::GetAngle3);
+        boot_param_reset_timeouts();
+        send_az_boot_request("GETANGLE3", "1", Pending::GetAngle3);
         s_angle_boot_phase = 3;
     }
     return true;
@@ -1972,9 +3449,231 @@ static bool parse_ack_getangle3(const char *line)
         clear_pending();
     }
     if (s_angle_boot_pending && s_angle_boot_phase == 3 && was) {
+        boot_param_reset_timeouts();
         s_angle_boot_pending = false;
         s_angle_boot_phase = 0;
+        s_enc_boot_pending = true;
+        s_enc_boot_phase = 1;
+        send_az_boot_request("GETENCTYPE", "0", Pending::GetEncType);
     }
+    return true;
+}
+
+static bool parse_ack_getenctype(const char *line)
+{
+    if (!strstr(line, ":ACK_GETENCTYPE:")) {
+        return false;
+    }
+    const float v = parse_ack_antoff_value_after_tag(line, ":ACK_GETENCTYPE:");
+    const bool valid = (v == v);
+    int type = 0;
+    if (valid) {
+        type = (int)(v + 0.5f);
+        if (type >= 1 && type <= 3) {
+            pwm_config_set_enc_type((uint8_t)type);
+        }
+    }
+    const bool was = (s_pending == Pending::GetEncType);
+    if (was) {
+        clear_pending();
+    }
+    if (s_enc_boot_pending && s_enc_boot_phase == 1 && was) {
+        s_enc_boot_phase = 2;
+        send_az_boot_request("GETMAXDG", "0", Pending::GetMaxDg);
+    }
+    return true;
+}
+
+static bool parse_ack_getrotortype(const char *line)
+{
+    /* ACK_GETROTORTYPE oder kürzeres ACK_ROTORTYPE */
+    const char *tag = nullptr;
+    if (strstr(line, ":ACK_GETROTORTYPE:")) {
+        tag = ":ACK_GETROTORTYPE:";
+    } else if (strstr(line, ":ACK_ROTORTYPE:")) {
+        tag = ":ACK_ROTORTYPE:";
+    } else {
+        return false;
+    }
+    const float v = parse_ack_antoff_value_after_tag(line, tag);
+    const bool valid = (v == v);
+    if (valid) {
+        const int type = (int)(v + 0.5f);
+        if (type >= 1 && type <= 3) {
+            pwm_config_set_rotor_type((uint8_t)type);
+            s_el_rotor_type_known = true;
+            s_el_type_fail_count = 0;
+            s_pending_el_limits_changed = true;
+        }
+    }
+    const bool was = (s_pending == Pending::GetRotorType);
+    if (was) {
+        clear_pending();
+    }
+    if (s_el_status_boot_pending && s_el_status_boot_phase == 1 && was) {
+        s_el_status_boot_phase = 2;
+        send_request("GETREF", "0", Pending::GetRef);
+    }
+    return true;
+}
+
+static bool parse_ack_getmaxdg(const char *line)
+{
+    if (!strstr(line, ":ACK_GETMAXDG:")) {
+        return false;
+    }
+    const float v = parse_ack_antoff_value_after_tag(line, ":ACK_GETMAXDG:");
+    const bool valid = (v == v);
+    if (valid) {
+        pwm_config_set_axis_max_deg_raw(v);
+        s_pending_antenna_offset_notify = true;
+    }
+    const bool was = (s_pending == Pending::GetMaxDg);
+    if (was) {
+        clear_pending();
+    }
+    if (s_enc_boot_pending && s_enc_boot_phase == 2 && was) {
+        s_enc_boot_pending = false;
+        s_enc_boot_phase = 0;
+        s_name_boot_pending = true;
+        s_name_boot_phase = 1;
+        send_az_boot_request("GETANTNAME1", "0", Pending::GetAntName1);
+    }
+    return true;
+}
+
+/** ACK_GETANTNAMEn:PARAMS:CS$ — PARAMS = Name, optional mit ";0" fuer CS (wie GETCONANTNAME). */
+static bool parse_ack_getantname_label(const char *line, const char *ack_tag, char *out, size_t out_sz)
+{
+    const char *p = strstr(line, ack_tag);
+    if (!p || !out || out_sz == 0) {
+        return false;
+    }
+    p += strlen(ack_tag);
+    const char *dollar = strchr(p, '$');
+    if (!dollar) {
+        return false;
+    }
+    const char *last_colon = nullptr;
+    for (const char *q = p; q < dollar; ++q) {
+        if (*q == ':') {
+            last_colon = q;
+        }
+    }
+    if (!last_colon || last_colon <= p) {
+        return false;
+    }
+    size_t n = (size_t)(last_colon - p);
+    if (n >= out_sz) {
+        n = out_sz - 1;
+    }
+    memcpy(out, p, n);
+    out[n] = '\0';
+    char *semi = strchr(out, ';');
+    if (semi) {
+        *semi = '\0';
+    }
+    return true;
+}
+
+static bool parse_ack_getantname1(const char *line)
+{
+    if (!strstr(line, ":ACK_GETANTNAME1:")) {
+        return false;
+    }
+    char name[48];
+    if (parse_ack_getantname_label(line, ":ACK_GETANTNAME1:", name, sizeof(name))) {
+        pwm_config_set_antenna_label(1, name);
+        s_pending_config_changed_from_bus = true;
+    }
+    const bool was = (s_pending == Pending::GetAntName1);
+    if (was) {
+        clear_pending();
+    }
+    if (s_name_boot_pending && s_name_boot_phase == 1 && was) {
+        s_name_boot_phase = 2;
+        send_az_boot_request("GETANTNAME2", "0", Pending::GetAntName2);
+    }
+    return true;
+}
+
+static bool parse_ack_getantname2(const char *line)
+{
+    if (!strstr(line, ":ACK_GETANTNAME2:")) {
+        return false;
+    }
+    char name[48];
+    if (parse_ack_getantname_label(line, ":ACK_GETANTNAME2:", name, sizeof(name))) {
+        pwm_config_set_antenna_label(2, name);
+        s_pending_config_changed_from_bus = true;
+    }
+    const bool was = (s_pending == Pending::GetAntName2);
+    if (was) {
+        clear_pending();
+    }
+    if (s_name_boot_pending && s_name_boot_phase == 2 && was) {
+        s_name_boot_phase = 3;
+        send_az_boot_request("GETANTNAME3", "0", Pending::GetAntName3);
+    }
+    return true;
+}
+
+static bool parse_ack_getantname3(const char *line)
+{
+    if (!strstr(line, ":ACK_GETANTNAME3:")) {
+        return false;
+    }
+    char name[48];
+    if (parse_ack_getantname_label(line, ":ACK_GETANTNAME3:", name, sizeof(name))) {
+        pwm_config_set_antenna_label(3, name);
+        s_pending_config_changed_from_bus = true;
+    }
+    const bool was = (s_pending == Pending::GetAntName3);
+    if (was) {
+        clear_pending();
+    }
+    if (s_name_boot_pending && s_name_boot_phase == 3 && was) {
+        s_name_boot_pending = false;
+        s_name_boot_phase = 0;
+        s_pending_antenna_offset_notify = true;
+        /* Span + Namen bekannt — Status-Boot (Ref/Pos/Temp), auch im Mitläufer. */
+        s_status_boot_pending = true;
+        s_status_boot_phase = 1;
+        if (s_pending == Pending::None) {
+            send_request("GETREF", "0", Pending::GetRef);
+        }
+    }
+    return true;
+}
+
+/** ACK_GETASELECT:<1|2|3> vom AZ — lokale last_antenna / UI nachziehen. */
+static bool parse_ack_getaselect(const char *line)
+{
+    const char *p = strstr(line, ":ACK_GETASELECT:");
+    if (!p) {
+        return false;
+    }
+    p += strlen(":ACK_GETASELECT:");
+    unsigned v = 0;
+    if (sscanf(p, "%u", &v) != 1 || v < 1u || v > 3u) {
+        if (s_pending == Pending::GetAselect) {
+            clear_pending();
+        }
+        s_aselect_boot_pending = false;
+        return true;
+    }
+    const uint8_t prev = pwm_config_get_last_antenna();
+    if (prev != (uint8_t)v) {
+        queue_remote_antenna_apply(prev, (uint8_t)v);
+        schedule_pwm_config_save_from_bus();
+    } else {
+        pwm_config_set_last_antenna((uint8_t)v);
+    }
+    if (s_pending == Pending::GetAselect) {
+        clear_pending();
+    }
+    s_aselect_boot_pending = false;
+    boot_param_reset_timeouts();
     return true;
 }
 
@@ -2008,16 +3707,55 @@ static bool parse_ack_getref(const char *line)
     notify_ref(ref_ok);
     const bool became_referenced = ref_ok && !was_referenced;
 
+    if (!s_el_status_boot_pending) {
+        s_axis_switch_getref_pending = false;
+        s_axis_switch_getref_tries = 0;
+        s_ref_state_known = true;
+    }
+
     if (s_pending == Pending::GetRef) {
         clear_pending();
+    }
+
+    /* Status-Boot (auch Mitläufer): GETREF → GETPOSDG oder direkt Temperaturen */
+    if (s_status_boot_pending && s_status_boot_phase == 1) {
+        if (ref_ok) {
+            s_status_boot_phase = 2;
+            s_align_target_after_pos_read = true;
+            send_request("GETPOSDG", "0", Pending::GetPosDg);
+        } else {
+            s_status_boot_phase = 3;
+            send_request("GETTEMPA", "0", Pending::GetTempA);
+        }
+        return true;
+    }
+
+    /* EL-Status-Boot: GETREF → GETPOSDG oder fertig (Phase 2 = nach GETROTORTYPE) */
+    if (s_el_status_boot_pending && s_el_status_boot_phase == 2) {
+        s_el_status_boot_phase = 3;
+        if (ref_ok) {
+            send_request("GETPOSDG", "0", Pending::GetPosDg);
+        } else {
+            el_status_boot_finish();
+        }
+        return true;
     }
 
     if (s_err10_recovery_getref_pending) {
         s_err10_recovery_getref_pending = false;
         if (ref_ok) {
             s_poll_ref = false;
-            s_align_target_after_pos_read = true;
-            send_request("GETPOSDG", "0", Pending::GetPosDg);
+            if (s_poll_pos) {
+                /* Fahrt lief bereits vor dem Aussetzer und wurde ueber
+                 * s_resume_poll_pos_after_conn_loss schon reaktiviert (siehe process_complete_line):
+                 * Soll NICHT auf die aktuelle Ist-Position zuruecksetzen — sonst "springt" das
+                 * angezeigte Ziel beim kurzen Verbindungsaussetzer auf die Position beim Reconnect
+                 * statt beim urspruenglich befohlenen Winkel zu bleiben. Das naechste GETPOSDG kommt
+                 * ohnehin ueber das normale Polling (s_next_pos_poll_ms). */
+            } else {
+                s_align_target_after_pos_read = true;
+                send_request("GETPOSDG", "0", Pending::GetPosDg);
+            }
         }
         return true;
     }
@@ -2048,11 +3786,17 @@ static bool parse_ack_getref(const char *line)
     /*
      * Referenz neu erlangt (z. B. Slave war weg, Homing ohne Flag-Pfad): Ist immer frisch holen,
      * sonst bleibt s_last_pos_ui_deg / UI auf altem Wert.
+     * Nach AZ↔EL: Position holen, aber Soll nicht auf Ist setzen (App-Cache behalten).
      */
     if (became_referenced && s_pending == Pending::None) {
         s_poll_ref = false;
         s_homing_wait_unref_seen = false;
-        s_align_target_after_pos_read = true;
+        if (s_axis_switch_pos_refresh) {
+            s_axis_switch_pos_refresh = false;
+            s_align_target_after_pos_read = false;
+        } else {
+            s_align_target_after_pos_read = true;
+        }
         send_request("GETPOSDG", "0", Pending::GetPosDg);
         return true;
     }
@@ -2095,14 +3839,53 @@ static bool parse_ack_getposdg(const char *line)
     }
     valbuf[i] = '\0';
     const float deg_raw = parse_rs485_deg_valbuf_to_float(valbuf);
-    const float deg = normalize_deg_0_360(deg_raw);
-    const float deg_ui = bus_deg_for_ui(deg, deg_raw);
-    /* Ist: immer aus Slave-Position (Mitläufer-PC kann GETPOSDG mitschicken — Anzeige bleibt aktuell). */
-    notify_pos(deg_ui);
+    const uint8_t el_id = pwm_config_get_rotor_el_id();
+    const bool is_el_ack = (el_id != 0u && ack_src == (unsigned)el_id);
+    float deg;
+    if (is_el_ack) {
+        const float el_max = pwm_config_get_el_max_deg();
+        deg = deg_raw;
+        if (deg < 0.0f) {
+            deg = 0.0f;
+        } else if (deg > el_max) {
+            deg = el_max;
+        }
+    } else {
+        deg = normalize_deg_span(deg_raw);
+    }
+    const float deg_ui = bus_deg_for_ui(deg, deg_raw, is_el_ack);
 
     const bool for_us = (ack_dst == (unsigned)s_master_id);
+    const bool is_ka_ack =
+        s_ka_active && (ack_src == (unsigned)s_ka_slave_id) &&
+        (s_pending == Pending::GetPosDg) && (s_getposdg_dst == s_ka_slave_id);
+
+    if (is_ka_ack) {
+        if (for_us) {
+            clear_pending();
+        }
+        ka_on_getposdg(deg);
+        return true;
+    }
+
+    /* Ist: immer aus Slave-Position (Mitläufer-PC kann GETPOSDG mitschicken — Anzeige bleibt aktuell).
+     * Keepalive der anderen Achse darf die aktive UI nicht überschreiben. */
+    if (!(s_ka_active && ack_src == (unsigned)s_ka_slave_id)) {
+        notify_pos(deg_ui);
+    }
+
     if (for_us && s_pending == Pending::GetPosDg) {
         clear_pending();
+    }
+
+    if (for_us && s_status_boot_pending && s_status_boot_phase == 2) {
+        s_status_boot_phase = 3;
+        send_request("GETTEMPA", "0", Pending::GetTempA);
+    }
+
+    if (for_us && s_el_status_boot_pending && s_el_status_boot_phase == 3) {
+        el_status_boot_finish();
+        return true;
     }
 
     if (for_us && !s_boot_done && s_boot_phase == 2) {
@@ -2112,9 +3895,10 @@ static bool parse_ack_getposdg(const char *line)
 
     /* Positionsfahrt / Toleranz:
      * - Eigenbetrieb: nur eigene GETPOSDG-ACKs (for_us)
-     * - Mitlaeuferbetrieb: fremde GETPOSDG-ACKs mitnutzen, damit kein zusaetzlicher eigener GETPOSDG-Sturm entsteht. */
+     * - Mitlaeuferbetrieb: fremde GETPOSDG-ACKs mitnutzen, damit kein zusaetzlicher eigener GETPOSDG-Sturm entsteht.
+     * Lineare Distanz: mechanischer Anschlag — bei Span>360 wären 361° und 1° sonst fälschlich „angekommen“. */
     if (s_poll_pos && (for_us || rotor_rs485_is_foreign_pc_listen_mode())) {
-        if (min_angle_diff(deg, s_target_deg) <= ROTOR_POS_TOL_DEG) {
+        if (linear_span_diff(deg, s_target_deg) <= ROTOR_POS_TOL_DEG) {
             if (s_pos_grace_end_ms == 0) {
                 s_pos_grace_end_ms = millis() + ROTOR_POLL_POS_GRACE_MS;
             }
@@ -2135,7 +3919,7 @@ static bool parse_ack_getposdg(const char *line)
 
     /* PC-/USB-Fahrt: gleiche Toleranz wie lokales Polling, kein s_poll_pos */
     if (s_remote_setpos_motion && !s_poll_pos) {
-        if (min_angle_diff(deg, s_remote_setpos_target_deg) <= ROTOR_POS_TOL_DEG) {
+        if (linear_span_diff(deg, s_remote_setpos_target_deg) <= ROTOR_POS_TOL_DEG) {
             if (s_remote_setpos_grace_end_ms == 0) {
                 s_remote_setpos_grace_end_ms = millis() + ROTOR_POLL_POS_GRACE_MS;
             }
@@ -2148,7 +3932,10 @@ static bool parse_ack_getposdg(const char *line)
         }
     }
 
-    if (for_us && s_align_target_after_pos_read) {
+    /* Start-/Homing-Sync: Soll auf ersten frischen Ist-Wert legen.
+     * Nicht an for_us koppeln — Ist wird aus demselben ACK bereits übernommen, sonst bleibt taget
+     * gelegentlich auf 0/360 und der Encoder startet vom falschen Bezug. */
+    if (s_align_target_after_pos_read) {
         s_align_target_after_pos_read = false;
         s_target_deg = deg;
         notify_target(deg_ui);
@@ -2179,10 +3966,11 @@ static bool parse_ack_err(const char *line)
         }
     }
     if (code != 0) {
-        rotor_error_app_set_error_code(code);
+        rotor_error_app_report_rotor_err(code);
         stop_fault_motion_polling();
     } else {
-        /* Verbindungstimeout (10) nur hier aufheben — nicht bei beliebiger Slave-Zeile (sonst GETREF=1 → „Betriebsbereit“ vor ACK_ERR). */
+        /* ACK_ERR:0 — lokalen Watchdog-10 und Rotor-ERR:10 quittieren */
+        rotor_error_app_report_rotor_err(0);
         rotor_error_app_set_error_code(0);
     }
     if (pending_geterr) {
@@ -2196,6 +3984,11 @@ static bool parse_nak_and_clear(const char *line)
 {
     if (strstr(line, ":NAK_GETREF:") && s_pending == Pending::GetRef) {
         clear_pending();
+        /* Slave lehnt GETREF ab: Achsenwechsel-Abfrage beenden, Cache-Wert gilt als Stand —
+         * sonst bliebe die Referenzfahrt per Taster dauerhaft gesperrt. */
+        s_axis_switch_getref_pending = false;
+        s_axis_switch_getref_tries = 0;
+        s_ref_state_known = true;
         /* Während aktivem Homing darf ein einzelnes NAK_GETREF den Homing-Zyklus nicht abbrechen.
          * Sonst stoppt Ring-"Kreiseln" vorzeitig und UI springt auf "Nicht referenziert". */
         if (s_poll_ref) {
@@ -2207,6 +4000,13 @@ static bool parse_nak_and_clear(const char *line)
         if (!s_boot_done && s_boot_phase == 1) {
             s_boot_done = true;
             s_boot_phase = 3;
+        }
+        if (s_status_boot_pending && s_status_boot_phase == 1) {
+            s_status_boot_phase = 3;
+            send_request("GETTEMPA", "0", Pending::GetTempA);
+        }
+        if (s_el_status_boot_pending && s_el_status_boot_phase == 2) {
+            el_status_boot_finish();
         }
         return true;
     }
@@ -2221,6 +4021,26 @@ static bool parse_nak_and_clear(const char *line)
         if (!s_boot_done && s_boot_phase == 2) {
             s_boot_done = true;
             s_boot_phase = 3;
+        }
+        if (s_status_boot_pending && s_status_boot_phase == 2) {
+            s_status_boot_phase = 3;
+            send_request("GETTEMPA", "0", Pending::GetTempA);
+        }
+        if (s_el_status_boot_pending && s_el_status_boot_phase == 3) {
+            el_status_boot_finish();
+        }
+        return true;
+    }
+    if (strstr(line, ":NAK_GETROTORTYPE:") && s_pending == Pending::GetRotorType) {
+        clear_pending();
+        if (s_el_status_boot_pending && s_el_status_boot_phase == 1) {
+            /* EL antwortet mit NAK oder unbekanntes CMD: Probe beenden, AZ freigeben. */
+            el_status_boot_finish();
+        } else {
+            s_el_type_fail_count++;
+            if (s_el_type_fail_count >= ROTOR_EL_TYPE_MAX_FAILS) {
+                s_el_rotor_type_known = true;
+            }
         }
         return true;
     }
@@ -2263,32 +4083,119 @@ static bool parse_nak_and_clear(const char *line)
     }
     if (strstr(line, ":NAK_GETANTOFF1:") && s_pending == Pending::GetAntOff1) {
         clear_pending();
-        abort_antenna_boot();
+        boot_param_reset_timeouts();
+        if (s_antenna_boot_pending && s_antenna_boot_phase == 1) {
+            s_antenna_boot_phase = 2;
+            send_az_boot_request("GETANTOFF2", "1", Pending::GetAntOff2);
+        }
         return true;
     }
     if (strstr(line, ":NAK_GETANTOFF2:") && s_pending == Pending::GetAntOff2) {
         clear_pending();
-        abort_antenna_boot();
+        boot_param_reset_timeouts();
+        if (s_antenna_boot_pending && s_antenna_boot_phase == 2) {
+            s_antenna_boot_phase = 3;
+            send_az_boot_request("GETANTOFF3", "1", Pending::GetAntOff3);
+        }
         return true;
     }
     if (strstr(line, ":NAK_GETANTOFF3:") && s_pending == Pending::GetAntOff3) {
         clear_pending();
-        abort_antenna_boot();
+        boot_param_reset_timeouts();
+        if (s_antenna_boot_pending && s_antenna_boot_phase == 3) {
+            s_antenna_boot_phase = 4;
+            send_az_boot_request("GETANTDP1", "1", Pending::GetAntDp1);
+        }
+        return true;
+    }
+    if (strstr(line, ":NAK_GETANTDP1:") && s_pending == Pending::GetAntDp1) {
+        clear_pending();
+        boot_param_reset_timeouts();
+        if (s_antenna_boot_pending && s_antenna_boot_phase == 4) {
+            s_antenna_boot_phase = 5;
+            send_az_boot_request("GETANTDP2", "1", Pending::GetAntDp2);
+        }
+        return true;
+    }
+    if (strstr(line, ":NAK_GETANTDP2:") && s_pending == Pending::GetAntDp2) {
+        clear_pending();
+        boot_param_reset_timeouts();
+        if (s_antenna_boot_pending && s_antenna_boot_phase == 5) {
+            s_antenna_boot_phase = 6;
+            send_az_boot_request("GETANTDP3", "1", Pending::GetAntDp3);
+        }
+        return true;
+    }
+    if (strstr(line, ":NAK_GETANTDP3:") && s_pending == Pending::GetAntDp3) {
+        clear_pending();
+        boot_param_reset_timeouts();
+        if (s_antenna_boot_pending && s_antenna_boot_phase == 6) {
+            s_antenna_boot_pending = false;
+            s_antenna_boot_phase = 0;
+            s_angle_boot_pending = true;
+            s_angle_boot_phase = 1;
+            send_az_boot_request("GETANGLE1", "1", Pending::GetAngle1);
+        }
         return true;
     }
     if (strstr(line, ":NAK_GETANGLE1:") && s_pending == Pending::GetAngle1) {
         clear_pending();
-        abort_angle_boot();
+        boot_param_reset_timeouts();
+        if (s_angle_boot_pending && s_angle_boot_phase == 1) {
+            s_angle_boot_phase = 2;
+            send_az_boot_request("GETANGLE2", "1", Pending::GetAngle2);
+        }
         return true;
     }
     if (strstr(line, ":NAK_GETANGLE2:") && s_pending == Pending::GetAngle2) {
         clear_pending();
-        abort_angle_boot();
+        boot_param_reset_timeouts();
+        if (s_angle_boot_pending && s_angle_boot_phase == 2) {
+            s_angle_boot_phase = 3;
+            send_az_boot_request("GETANGLE3", "1", Pending::GetAngle3);
+        }
         return true;
     }
     if (strstr(line, ":NAK_GETANGLE3:") && s_pending == Pending::GetAngle3) {
         clear_pending();
-        abort_angle_boot();
+        boot_param_reset_timeouts();
+        if (s_angle_boot_pending && s_angle_boot_phase == 3) {
+            s_angle_boot_pending = false;
+            s_angle_boot_phase = 0;
+            s_enc_boot_pending = true;
+            s_enc_boot_phase = 1;
+            send_az_boot_request("GETENCTYPE", "0", Pending::GetEncType);
+        }
+        return true;
+    }
+    if (strstr(line, ":NAK_GETENCTYPE:") && s_pending == Pending::GetEncType) {
+        clear_pending();
+        abort_enc_boot();
+        return true;
+    }
+    if (strstr(line, ":NAK_GETMAXDG:") && s_pending == Pending::GetMaxDg) {
+        clear_pending();
+        abort_enc_boot();
+        return true;
+    }
+    if (strstr(line, ":NAK_GETANTNAME1:") && s_pending == Pending::GetAntName1) {
+        clear_pending();
+        abort_name_boot();
+        return true;
+    }
+    if (strstr(line, ":NAK_GETANTNAME2:") && s_pending == Pending::GetAntName2) {
+        clear_pending();
+        abort_name_boot();
+        return true;
+    }
+    if (strstr(line, ":NAK_GETANTNAME3:") && s_pending == Pending::GetAntName3) {
+        clear_pending();
+        abort_name_boot();
+        return true;
+    }
+    if (strstr(line, ":NAK_GETASELECT:") && s_pending == Pending::GetAselect) {
+        clear_pending();
+        s_aselect_boot_pending = false;
         return true;
     }
     if (strstr(line, ":NAK_GETERR:") && s_pending == Pending::GetErr) {
@@ -2300,18 +4207,37 @@ static bool parse_nak_and_clear(const char *line)
     }
     if (strstr(line, ":NAK_GETANEMO:") && s_pending == Pending::GetAnemo) {
         clear_pending();
+        if (s_status_boot_pending && s_status_boot_phase == 5) {
+            s_status_boot_phase = 6;
+            send_request("GETWINDDIR", "0", Pending::GetWindDir);
+        }
         return true;
     }
     if (strstr(line, ":NAK_GETTEMPA:") && s_pending == Pending::GetTempA) {
         clear_pending();
+        if (s_status_boot_pending && s_status_boot_phase == 3) {
+            s_status_boot_phase = 4;
+            send_request("GETTEMPM", "0", Pending::GetTempM);
+        }
         return true;
     }
     if (strstr(line, ":NAK_WINDDIR:") && s_pending == Pending::GetWindDir) {
         clear_pending();
+        if (s_status_boot_pending && s_status_boot_phase == 6) {
+            status_boot_finished_start_el();
+        }
         return true;
     }
     if (strstr(line, ":NAK_GETTEMPM:") && s_pending == Pending::GetTempM) {
         clear_pending();
+        if (s_status_boot_pending && s_status_boot_phase == 4) {
+            if (pwm_config_get_anemometer() != 0) {
+                s_status_boot_phase = 5;
+                send_request("GETANEMO", "0", Pending::GetAnemo);
+            } else {
+                status_boot_finished_start_el();
+            }
+        }
         return true;
     }
     return false;
@@ -2333,10 +4259,16 @@ static bool parse_slave_err(const char *line)
     }
     valbuf[i] = '\0';
     if (i > 0U) {
-        rotor_error_app_set_error_code(atoi(valbuf));
+        const int code = atoi(valbuf);
+        rotor_error_app_report_rotor_err(code);
+        if (code != 0) {
+            /* Auch ERR:10 vom Rotor: Fahrt/Polling stoppen und Störung anzeigen (nicht soft-Watchdog). */
+            stop_fault_motion_polling();
+        }
     }
     if (s_pending == Pending::GetAntOff1 || s_pending == Pending::GetAntOff2 ||
-        s_pending == Pending::GetAntOff3) {
+        s_pending == Pending::GetAntOff3 || s_pending == Pending::GetAntDp1 ||
+        s_pending == Pending::GetAntDp2 || s_pending == Pending::GetAntDp3) {
         clear_pending();
         abort_antenna_boot();
         return true;
@@ -2345,6 +4277,17 @@ static bool parse_slave_err(const char *line)
         s_pending == Pending::GetAngle3) {
         clear_pending();
         abort_angle_boot();
+        return true;
+    }
+    if (s_pending == Pending::GetEncType || s_pending == Pending::GetMaxDg) {
+        clear_pending();
+        abort_enc_boot();
+        return true;
+    }
+    if (s_pending == Pending::GetAntName1 || s_pending == Pending::GetAntName2 ||
+        s_pending == Pending::GetAntName3) {
+        clear_pending();
+        abort_name_boot();
         return true;
     }
     if (s_pending == Pending::GetPosDg || s_pending == Pending::SetPosDg || s_pending == Pending::Stop ||
@@ -2361,7 +4304,8 @@ static bool parse_slave_err(const char *line)
         s_remote_setpos_grace_end_ms = 0;
         return true;
     }
-    return false;
+    /* Auch ohne offenes Pending: ERR wurde übernommen (z. B. Broadcast im Idle). */
+    return true;
 }
 
 static void process_complete_line(const char *line, size_t len)
@@ -2376,15 +4320,20 @@ static void process_complete_line(const char *line, size_t len)
         return;
     }
 
-    /* Fremder Verkehr an unseren Rotor (Slave): Mitläufer-Modus. Auch SRC = unsere Master-ID, wenn es
+    /* Fremder Verkehr an AZ- oder EL-Slave: Mitläufer-Modus. Auch SRC = unsere Master-ID, wenn es
      * nicht unser Echo der zuletzt gesendeten Zeile ist (zwei Geräte mit gleicher master_id am Bus). */
-    if (dst == (unsigned)s_slave_id && src != (unsigned)s_slave_id) {
-        const bool other_master = (src != (unsigned)s_master_id);
-        const bool same_master_foreign =
-            (src == (unsigned)s_master_id) && !is_recent_own_dst_slave_line(line);
-        if (other_master || same_master_foreign) {
-            s_last_foreign_master_to_slave_ms = millis();
-            s_foreign_master_src_id = (uint8_t)src;
+    if (is_configured_rotor_slave(dst) && src != dst) {
+        bool foreign = false;
+        if (src != (unsigned)s_master_id) {
+            foreign = true;
+        } else if (dst == (unsigned)s_slave_id) {
+            foreign = !is_recent_own_dst_slave_line(line);
+        } else {
+            /* Gleiche Master-ID an die inaktive Achse: PC/Proxy, nicht unser aktives Echo. */
+            foreign = true;
+        }
+        if (foreign) {
+            note_foreign_master_to_rotor(src);
         }
     }
 
@@ -2397,28 +4346,35 @@ static void process_complete_line(const char *line, size_t len)
 
     /* Broadcast DST=255: SETCONIDF / SETCONTID → neue master_id (config.json), wenn Controller-ID unbekannt */
     if (dst == ROTOR_RS485_BROADCAST_ID) {
-        /* Neuer Fehlerkanal: Rotor sendet asynchron ERR an Broadcast (#<rotor>:255:ERR:<code>:...). */
-        if (src == (unsigned)s_slave_id && parse_slave_err(line)) {
+        /* Neuer Fehlerkanal: Rotor sendet asynchron ERR an Broadcast (#<rotor>:255:ERR:<code>:...),
+         * laut aktueller Rotor-Firmware bis zu 3x hintereinander (Robustheit gegen Kollisionen).
+         * Jede gültige ERR-Zeile zählt für den Verbindungs-Watchdog — auch das 2./3. Duplikat, das
+         * kein offenes Pending mehr zum Abbrechen findet (parse_slave_err liefert dann false).
+         * Sonst hielte ein Duplikat ohne Pending faelschlich einen Verbindungstimeout (10) fuer moeglich,
+         * obwohl der Rotor gerade aktiv gemeldet hat. */
+        if (src == (unsigned)s_slave_id && strstr(line, ":ERR:")) {
             s_last_slave_rx_ms = millis();
             s_have_slave_rx_ever = true;
+            parse_slave_err(line);
             return;
         }
         if (strstr(line, ":SETCONIDF:") || strstr(line, ":SETCONTID:")) {
             handle_broadcast_set_controller_master_id(line, src);
             return;
         }
-        /* SETASELECT: auch bei SRC = eigene Master-ID (USB-Loopback vom PC; kein Echo von hw_send).
-         * Fremder Master am Broadcast: Mitläufer-Modus setzen (sonst fehlt dst==Slave bei 255). */
+        /* SETASELECT Broadcast: AZ speichert; Display übernimmt UI. Auch eigene Master-ID (USB-Loopback). */
         if (strstr(line, ":SETASELECT:")) {
-            unsigned v = 0;
-            if (parse_setaselect_antenna_1_to_3(line, &v)) {
-                if (src != (unsigned)s_master_id) {
-                    s_last_foreign_master_to_slave_ms = millis();
-                    s_foreign_master_src_id = (uint8_t)src;
-                }
-                const uint8_t prev = pwm_config_get_last_antenna();
-                queue_remote_antenna_apply(prev, (uint8_t)v);
-            }
+            (void)try_queue_setaselect_from_bus(line, dst, src);
+        }
+        return;
+    }
+
+    /* Inaktive Achse (andere Slave-ID): GETPOSDG/GETREF mitschneiden → Cache für Umschalten. */
+    if (is_inactive_rotor_slave(src)) {
+        s_last_slave_rx_ms = millis();
+        s_have_slave_rx_ever = true;
+        if (listen_inactive_slave_ack(line, src)) {
+            return;
         }
         return;
     }
@@ -2426,12 +4382,36 @@ static void process_complete_line(const char *line, size_t len)
     if (src == (unsigned)s_slave_id) {
         s_last_slave_rx_ms = millis();
         s_have_slave_rx_ever = true;
-        /* Ohne zyklisches GETERR: Verbindungstimeout(10) bei erster gueltiger Slave-Zeile aufheben.
-         * Echte Fehler kommen asynchron als ERR und setzen den Fehlercode danach wieder. */
-        if (rotor_error_app_get_error_code() == 10 && !strstr(line, ":ERR:")) {
+        /* Nur lokalen Verbindungs-Watchdog (soft 10) bei Slave-Verkehr aufheben — nicht Rotor-ERR:10,
+         * sonst verschwindet Broadcast #rotor:255:ERR:10:… sofort beim nächsten GETPOSDG/GETREF-ACK. */
+        if (rotor_error_app_get_error_code() == 10 && !rotor_error_app_is_rotor_reported() &&
+            !strstr(line, ":ERR:")) {
             rotor_error_app_set_error_code(0);
+            /* Kurzer Aussetzer (< 1 s) während einer Fahrt: Polling/Tracking fortsetzen statt im
+             * Idle-Polling (Wetter/Motortemp) hängen zu bleiben, obwohl der Rotor weiterdreht. */
+            if (s_resume_poll_pos_after_conn_loss) {
+                s_resume_poll_pos_after_conn_loss = false;
+                if (s_slave_referenced) {
+                    s_poll_pos = true;
+                    s_pos_grace_end_ms = 0;
+                    s_next_pos_poll_ms = 0;
+                }
+            }
+            if (s_resume_remote_setpos_after_conn_loss) {
+                s_resume_remote_setpos_after_conn_loss = false;
+                if (s_slave_referenced) {
+                    s_remote_setpos_motion = true;
+                    s_remote_setpos_grace_end_ms = 0;
+                }
+            }
         }
         if (parse_slave_err(line)) {
+            return;
+        }
+        if (parse_endstc_reply(line)) {
+            return;
+        }
+        if (parse_axis_enctype_reply(line)) {
             return;
         }
         if (parse_nak_and_clear(line)) {
@@ -2465,6 +4445,15 @@ static void process_complete_line(const char *line, size_t len)
         if (parse_ack_getantoff3(line)) {
             return;
         }
+        if (parse_ack_getantdp1(line)) {
+            return;
+        }
+        if (parse_ack_getantdp2(line)) {
+            return;
+        }
+        if (parse_ack_getantdp3(line)) {
+            return;
+        }
         if (parse_ack_getangle1(line)) {
             return;
         }
@@ -2472,6 +4461,27 @@ static void process_complete_line(const char *line, size_t len)
             return;
         }
         if (parse_ack_getangle3(line)) {
+            return;
+        }
+        if (parse_ack_getenctype(line)) {
+            return;
+        }
+        if (parse_ack_getrotortype(line)) {
+            return;
+        }
+        if (parse_ack_getmaxdg(line)) {
+            return;
+        }
+        if (parse_ack_getantname1(line)) {
+            return;
+        }
+        if (parse_ack_getantname2(line)) {
+            return;
+        }
+        if (parse_ack_getantname3(line)) {
+            return;
+        }
+        if (parse_ack_getaselect(line)) {
             return;
         }
         if (parse_ack_err(line)) {
@@ -2504,6 +4514,8 @@ static void process_complete_line(const char *line, size_t len)
 
     if (dst == (unsigned)s_slave_id) {
         dispatch_bus_command_to_slave(line, src);
+    } else if (is_inactive_rotor_slave(dst)) {
+        dispatch_bus_command_to_inactive_slave(line, src, dst);
     }
 }
 
@@ -2566,6 +4578,8 @@ void rotor_rs485_init(void)
 {
     rotor_rs485_pre_begin();
     s_err10_recovery_getref_pending = false;
+    s_resume_poll_pos_after_conn_loss = false;
+    s_resume_remote_setpos_after_conn_loss = false;
     s_boot_test_done = false;
     s_boot_test_timeout_count = 0;
     s_last_slave_rx_ms = 0;
@@ -2576,9 +4590,32 @@ void rotor_rs485_init(void)
     s_boot_phase = 0;
     s_startup_err_known = false;
     s_next_periodic_getref_ms = millis() + ROTOR_PERIODIC_GETREF_MS;
+    s_ref_state_known = false;
+    s_axis_switch_getref_pending = false;
+    s_axis_switch_getref_tries = 0;
     s_hw_snap_retarget_active = false;
     s_antenna_boot_pending = true;
     s_antenna_boot_phase = 0;
+    s_aselect_boot_pending = (pwm_config_get_rotor_id() != 0u);
+    s_boot_param_timeout_count = 0;
+    s_angle_boot_pending = false;
+    s_angle_boot_phase = 0;
+    s_enc_boot_pending = false;
+    s_enc_boot_phase = 0;
+    s_name_boot_pending = false;
+    s_name_boot_phase = 0;
+    s_status_boot_pending = false;
+    s_status_boot_phase = 0;
+    s_el_status_boot_pending = false;
+    s_el_status_boot_phase = 0;
+    s_el_rotor_type_known = false;
+    s_pending_el_limits_changed = false;
+    s_el_probe_timeout_count = 0;
+    s_el_type_fail_count = 0;
+    s_ka_active = false;
+    s_ka_slave_id = 0;
+    s_ka_grace_end_ms = 0;
+    s_getposdg_dst = 0;
     s_next_weather_ms = millis() + 2000u;
     s_weather_phase = 0;
     s_next_motortemp_ms = millis() + 2000u;
@@ -2590,12 +4627,62 @@ void rotor_rs485_init(void)
     s_pos_ui_deferred = false;
     s_ref_ui_value = s_slave_referenced;
     s_ref_ui_deferred = true;
+    s_target_ui_deferred = false;
+}
+
+void rotor_rs485_relink(void)
+{
+    clear_pending();
+    s_err10_recovery_getref_pending = false;
+    s_resume_poll_pos_after_conn_loss = false;
+    s_resume_remote_setpos_after_conn_loss = false;
+    s_boot_test_done = false;
+    s_boot_test_timeout_count = 0;
+    s_boot_done = false;
+    s_boot_phase = 0;
+    s_startup_err_known = false;
+    s_ref_state_known = false;
+    s_boot_earliest_ms = millis() + 200u;
+    s_next_periodic_getref_ms = millis() + ROTOR_PERIODIC_GETREF_MS;
+    s_antenna_boot_pending = true;
+    s_antenna_boot_phase = 0;
+    s_aselect_boot_pending = (pwm_config_get_rotor_id() != 0u);
+    s_boot_param_timeout_count = 0;
+    s_angle_boot_pending = false;
+    s_angle_boot_phase = 0;
+    s_enc_boot_pending = false;
+    s_enc_boot_phase = 0;
+    s_name_boot_pending = false;
+    s_name_boot_phase = 0;
+    s_status_boot_pending = false;
+    s_status_boot_phase = 0;
+    s_el_status_boot_pending = false;
+    s_el_status_boot_phase = 0;
+    s_el_rotor_type_known = false;
+    s_poll_pos = false;
+    s_poll_ref = false;
+    s_request_pos_after_homing = false;
+    s_last_foreign_master_to_slave_ms = 0;
+    s_foreign_master_src_id = 0;
+    if (rotor_error_app_get_error_code() == 10) {
+        rotor_error_app_set_error_code(0);
+    }
+    s_have_slave_rx_ever = false;
+    s_last_slave_rx_ms = 0;
+    s_conn_watch_start_ms = 0;
+    rotor_rs485_arm_conn_watchdog();
+    s_conn_watch_start_ms = millis();
 }
 
 /** Erstes Paket nach Einschalten: TEST (Ping), 3 Versuche ohne ACK → Fehler 10 */
 static void try_boot_test(void)
 {
     if (s_boot_test_done) {
+        return;
+    }
+    /* Remote USB: kein Boot-TEST ohne aktuelle PC-Software (sonst Soft-10-Irrweg). */
+    if ((serial_bridge::remote_usb_active() || pwm_config_get_remote_usb() != 0u) &&
+        !serial_bridge::remote_usb_pc_seen()) {
         return;
     }
     const int e = rotor_error_app_get_error_code();
@@ -2653,17 +4740,289 @@ static void try_boot_getref()
     }
 }
 
-/** Erstes GETANTOFF1 nach Boot (Kette ACK → GET2 → GET3 in den Parsern). */
+/** GETASELECT vom AZ lesen (Antennenwahl liegt im AZ-Rotor). */
+static void try_aselect_boot_step(void)
+{
+    if (!s_aselect_boot_pending) {
+        return;
+    }
+    if (!s_boot_done) {
+        return;
+    }
+    const uint8_t az = pwm_config_get_rotor_id();
+    if (az == 0u) {
+        s_aselect_boot_pending = false;
+        return;
+    }
+    /* Nicht hinter s_poll_pos/s_poll_ref warten — sonst startet die Param-Kette nie. */
+    if (s_pending != Pending::None) {
+        return;
+    }
+    send_az_boot_request("GETASELECT", "0", Pending::GetAselect);
+}
+
+/** Antennen-Boot: GETANTOFF1→2→3 → GETANTDP1→2→3 (Kette läuft in den ACK-Parsern weiter).
+ * Immer an AZ-ID. Bei Timeout (Pending) Retry; nach ROTOR_BOOT_PARAM_MAX_TIMEOUTS weiter. */
 static void try_antenna_boot_first_get(void)
 {
-    if (!s_boot_done || !s_antenna_boot_pending || s_antenna_boot_phase != 0) {
+    if (!s_boot_done || !s_antenna_boot_pending) {
         return;
     }
-    if (s_poll_pos || s_poll_ref) {
+    if (s_aselect_boot_pending) {
         return;
     }
-    send_request("GETANTOFF1", "1", Pending::GetAntOff1);
-    s_antenna_boot_phase = 1;
+    const uint8_t az = pwm_config_get_rotor_id();
+    if (az == 0u) {
+        abort_antenna_boot();
+        return;
+    }
+    if (s_pending != Pending::None) {
+        return;
+    }
+    switch (s_antenna_boot_phase) {
+    case 0:
+        send_az_boot_request("GETANTOFF1", "1", Pending::GetAntOff1);
+        s_antenna_boot_phase = 1;
+        break;
+    case 1:
+        send_az_boot_request("GETANTOFF1", "1", Pending::GetAntOff1);
+        break;
+    case 2:
+        send_az_boot_request("GETANTOFF2", "1", Pending::GetAntOff2);
+        break;
+    case 3:
+        send_az_boot_request("GETANTOFF3", "1", Pending::GetAntOff3);
+        break;
+    case 4:
+        send_az_boot_request("GETANTDP1", "1", Pending::GetAntDp1);
+        break;
+    case 5:
+        send_az_boot_request("GETANTDP2", "1", Pending::GetAntDp2);
+        break;
+    case 6:
+        send_az_boot_request("GETANTDP3", "1", Pending::GetAntDp3);
+        break;
+    default:
+        break;
+    }
+}
+
+/** Öffnungswinkel-Boot: GETANGLE1→2→3 an AZ. */
+static void try_angle_boot_step(void)
+{
+    if (!s_angle_boot_pending) {
+        return;
+    }
+    if (s_pending != Pending::None) {
+        return;
+    }
+    switch (s_angle_boot_phase) {
+    case 1:
+        send_az_boot_request("GETANGLE1", "1", Pending::GetAngle1);
+        break;
+    case 2:
+        send_az_boot_request("GETANGLE2", "1", Pending::GetAngle2);
+        break;
+    case 3:
+        send_az_boot_request("GETANGLE3", "1", Pending::GetAngle3);
+        break;
+    default:
+        break;
+    }
+}
+
+/** Encoder-Typ / Max-Winkel-Boot: GETENCTYPE → GETMAXDG (AZ). */
+static void try_enc_boot_step(void)
+{
+    if (!s_enc_boot_pending) {
+        return;
+    }
+    if (s_pending != Pending::None) {
+        return;
+    }
+    switch (s_enc_boot_phase) {
+    case 1:
+        send_az_boot_request("GETENCTYPE", "0", Pending::GetEncType);
+        break;
+    case 2:
+        send_az_boot_request("GETMAXDG", "0", Pending::GetMaxDg);
+        break;
+    default:
+        break;
+    }
+}
+
+/** Antennennamen-Boot: GETANTNAME1→2→3 (AZ). */
+static void try_name_boot_step(void)
+{
+    if (!s_name_boot_pending) {
+        return;
+    }
+    if (s_pending != Pending::None) {
+        return;
+    }
+    switch (s_name_boot_phase) {
+    case 1:
+        send_az_boot_request("GETANTNAME1", "0", Pending::GetAntName1);
+        break;
+    case 2:
+        send_az_boot_request("GETANTNAME2", "0", Pending::GetAntName2);
+        break;
+    case 3:
+        send_az_boot_request("GETANTNAME3", "0", Pending::GetAntName3);
+        break;
+    default:
+        break;
+    }
+}
+
+/** AZ-Status-Boot fertig → ggf. EL-Status-Boot (GETREF/GETPOSDG) anstoßen. */
+static void status_boot_finished_start_el(void)
+{
+    s_status_boot_pending = false;
+    s_status_boot_phase = 0;
+    s_pending_config_changed_from_bus = true;
+    const uint8_t el = pwm_config_get_rotor_el_id();
+    const uint8_t az = pwm_config_get_rotor_id();
+    if (el == 0 || el == az) {
+        return;
+    }
+    s_el_boot_saved_slave = s_slave_id;
+    s_el_boot_saved_ref = s_slave_referenced;
+    s_el_boot_saved_pos = s_last_pos_ui_deg;
+    s_el_boot_ref = false;
+    s_el_boot_pos = 0.0f;
+    s_el_boot_have_pos = false;
+    s_el_probe_timeout_count = 0;
+    s_el_status_boot_pending = true;
+    s_el_status_boot_phase = 1;
+}
+
+static void el_status_boot_finish(void)
+{
+    /* Offene EL-Probe beenden — sonst bleibt Pending auf EL und AZ kann nicht homen. */
+    if (s_pending == Pending::GetRotorType || s_pending == Pending::GetRef ||
+        s_pending == Pending::GetPosDg) {
+        clear_pending();
+    }
+    if (s_el_boot_have_pos || s_el_boot_ref) {
+        rotor_app_seed_axis_cache(1, s_el_boot_have_pos ? s_el_boot_pos : 0.0f, s_el_boot_ref);
+    } else {
+        rotor_app_seed_axis_cache(1, 0.0f, false);
+    }
+    /* Auch AZ-Cache aus aktuellem Stand (vor Restore). */
+    rotor_app_seed_axis_cache(0, s_el_boot_saved_pos, s_el_boot_saved_ref);
+
+    s_slave_id = s_el_boot_saved_slave;
+    s_slave_referenced = s_el_boot_saved_ref;
+    s_last_pos_ui_deg = s_el_boot_saved_pos;
+    s_el_status_boot_pending = false;
+    s_el_status_boot_phase = 0;
+    s_el_probe_timeout_count = 0;
+    /* Watchdog: nach Rückkehr auf AZ nicht sofort Fehler 10, bis AZ wieder ACK liefert. */
+    if (s_have_slave_rx_ever) {
+        s_last_slave_rx_ms = millis();
+    }
+    /* EL unerreichbar: Typ-Nachfragen stoppen (Default 0…180 bleibt). */
+    if (!s_el_rotor_type_known) {
+        s_el_rotor_type_known = true;
+    }
+}
+
+/** EL-Probe: Timeout — nach wenigen Versuchen aufgeben, AZ wiederherstellen. */
+static bool el_probe_on_timeout(void)
+{
+    if (!s_el_status_boot_pending) {
+        return false;
+    }
+    s_el_probe_timeout_count++;
+    if (s_el_probe_timeout_count >= ROTOR_EL_PROBE_MAX_TIMEOUTS) {
+        el_status_boot_finish();
+        return true;
+    }
+    return false;
+}
+
+/** EL-Status-Boot: GETROTORTYPE → GETREF → optional GETPOSDG, Cache, zurück auf AZ-Slave. */
+static void try_el_status_boot_step(void)
+{
+    if (!s_el_status_boot_pending) {
+        return;
+    }
+    if (s_status_boot_pending || boot_param_chain_active()) {
+        return;
+    }
+    if (s_pending != Pending::None || s_poll_pos || s_poll_ref) {
+        return;
+    }
+    switch (s_el_status_boot_phase) {
+    case 1:
+        s_slave_id = pwm_config_get_rotor_el_id();
+        send_line_to(s_slave_id, "GETROTORTYPE", "0");
+        set_pending(Pending::GetRotorType);
+        break;
+    case 2:
+        s_slave_id = pwm_config_get_rotor_el_id();
+        send_request("GETREF", "0", Pending::GetRef);
+        break;
+    case 3:
+        if (!s_el_boot_ref) {
+            el_status_boot_finish();
+            break;
+        }
+        send_request("GETPOSDG", "0", Pending::GetPosDg);
+        break;
+    default:
+        el_status_boot_finish();
+        break;
+    }
+}
+
+/** Status-Boot: GETREF→GETPOSDG→Temps (auch Mitläufer); Retry bei Timeout. */
+static void try_status_boot_step(void)
+{
+    if (!s_status_boot_pending) {
+        return;
+    }
+    if (boot_param_chain_active()) {
+        return;
+    }
+    if (s_pending != Pending::None || s_poll_pos || s_poll_ref) {
+        return;
+    }
+    switch (s_status_boot_phase) {
+    case 1:
+        send_request("GETREF", "0", Pending::GetRef);
+        break;
+    case 2:
+        if (!s_slave_referenced) {
+            s_status_boot_phase = 3;
+            send_request("GETTEMPA", "0", Pending::GetTempA);
+            break;
+        }
+        s_align_target_after_pos_read = true;
+        send_request("GETPOSDG", "0", Pending::GetPosDg);
+        break;
+    case 3:
+        send_request("GETTEMPA", "0", Pending::GetTempA);
+        break;
+    case 4:
+        send_request("GETTEMPM", "0", Pending::GetTempM);
+        break;
+    case 5:
+        if (pwm_config_get_anemometer() == 0) {
+            status_boot_finished_start_el();
+            break;
+        }
+        send_request("GETANEMO", "0", Pending::GetAnemo);
+        break;
+    case 6:
+        send_request("GETWINDDIR", "0", Pending::GetWindDir);
+        break;
+    default:
+        status_boot_finished_start_el();
+        break;
+    }
 }
 
 /** GETANEMO / GETTEMPA / GETWINDDIR nur ohne Fremd-PC, Stillstand (kein Homing-/Positions-Polling).
@@ -2677,6 +5036,18 @@ static void try_weather_poll(void)
         return;
     }
     if (s_angle_boot_pending && s_angle_boot_phase != 0) {
+        return;
+    }
+    if (s_enc_boot_pending && s_enc_boot_phase != 0) {
+        return;
+    }
+    if (s_name_boot_pending && s_name_boot_phase != 0) {
+        return;
+    }
+    if (s_status_boot_pending) {
+        return;
+    }
+    if (s_el_status_boot_pending) {
         return;
     }
     if ((int32_t)(millis() - s_next_weather_ms) < 0) {
@@ -2714,6 +5085,15 @@ static void try_motor_temp_poll(void)
     if (s_angle_boot_pending && s_angle_boot_phase != 0) {
         return;
     }
+    if (s_enc_boot_pending && s_enc_boot_phase != 0) {
+        return;
+    }
+    if (s_name_boot_pending && s_name_boot_phase != 0) {
+        return;
+    }
+    if (s_status_boot_pending) {
+        return;
+    }
     if ((int32_t)(millis() - s_next_motortemp_ms) < 0) {
         return;
     }
@@ -2721,11 +5101,61 @@ static void try_motor_temp_poll(void)
     s_next_motortemp_ms = millis() + ROTOR_MOTOR_TEMP_POLL_MS;
 }
 
+/**
+ * Nach AZ↔EL: GETREF an die neue Slave-ID — auch als Mitläufer, sonst bliebe der Referenzstatus
+ * der neuen Achse unbestätigt (Meldetext/LED aus Cache, Taster-Homing gesperrt).
+ */
+static void try_axis_switch_getref(void)
+{
+    if (!s_axis_switch_getref_pending || s_pending != Pending::None) {
+        return;
+    }
+    if (s_slave_id == 0u || s_el_status_boot_pending || !s_boot_test_done) {
+        return;
+    }
+    if ((int32_t)(millis() - s_axis_switch_getref_next_ms) < 0) {
+        return;
+    }
+    if (s_axis_switch_getref_tries >= ROTOR_AXIS_SWITCH_GETREF_MAX_TRIES) {
+        /* Slave antwortet nicht: Cache-Wert gilt, Bedienung nicht dauerhaft sperren. */
+        s_axis_switch_getref_pending = false;
+        s_axis_switch_getref_tries = 0;
+        s_ref_state_known = true;
+        return;
+    }
+    if (!bus_send_allowed_by_fault()) {
+        return;
+    }
+    s_axis_switch_getref_tries++;
+    s_axis_switch_getref_next_ms = millis() + ROTOR_POLL_GAP_MS;
+    send_line_to(s_slave_id, "GETREF", "0");
+    set_pending(Pending::GetRef);
+}
+
 void rotor_rs485_loop(void)
 {
+    /* Remote-USB (Config oder Bridge): Soft-10 aus. Ohne PC-Frames kein Boot/Polling. */
+    const bool remote =
+        serial_bridge::remote_usb_active() || (pwm_config_get_remote_usb() != 0u);
+    if (remote) {
+        if (!serial_bridge::remote_usb_active()) {
+            serial_bridge::set_remote_usb(true);
+        }
+        if (!serial_bridge::remote_usb_pc_seen()) {
+            const bool homing_busy =
+                rotor_rs485_is_homing() || s_poll_ref || s_request_pos_after_homing;
+            if (!(homing_busy && serial_bridge::remote_usb_link_session())) {
+                if (s_pending != Pending::None) {
+                    clear_pending();
+                }
+                return;
+            }
+        }
+    }
+
     const int err = rotor_error_app_get_error_code();
-    /* Harte Fehler (≠10): kein Polling — Verbindungstimeout (10): GETREF-Recovery weiter unten */
-    if (err != 0 && err != 10) {
+    /* Harte Fehler inkl. Rotor-ERR:10: kein Polling — nur lokaler Watchdog-10: GETREF-Recovery */
+    if (rotor_error_app_is_fault_locked()) {
         return;
     }
 
@@ -2733,9 +5163,20 @@ void rotor_rs485_loop(void)
      * als ROTOR_CONN_LOST_TIMEOUT_MS keine ACKs senden — sonst Fehler 10, stop_fault_motion_polling()
      * bricht Homing ab (Ring stoppt, „Nicht referenziert“ obwohl der Bus danach wieder ok ist).
      * s_poll_ref || s_request_pos_after_homing gilt auch kurz nach SETREF, solange der Slave noch
-     * GETREF=1 meldet (s_slave_referenced true), bis das erste „nicht referenziert“ verarbeitet ist. */
-    if (err != 10 && s_boot_test_done && !(s_poll_ref || s_request_pos_after_homing)) {
-        const uint32_t now = millis();
+     * GETREF=1 meldet (s_slave_referenced true), bis das erste „nicht referenziert“ verarbeitet ist.
+    /* Ebenso während EL-Probe: unerreichbare EL darf AZ nicht mit Fehler 10 sperren.
+     * Während Arc-Drag / Encoder-SETPOSCC: nur Vorschau an PC/Slave, oft ohne ACK_GETPOS —
+     * sonst Verbindungsfehler obwohl der Nutzer aktiv am Display dreht. */
+    const uint32_t now_wd = millis();
+    const bool setposcc_preview_recent =
+        (s_last_setposcc_tx_ms != 0) &&
+        ((uint32_t)(now_wd - s_last_setposcc_tx_ms) < ROTOR_SETPOSCC_WATCHDOG_GRACE_MS);
+    if (err != 10 && s_boot_test_done && !(s_poll_ref || s_request_pos_after_homing) &&
+        !s_el_status_boot_pending && !setposcc_preview_recent &&
+        !rotor_app_is_ui_preview_active() &&
+        !serial_bridge::remote_usb_active() &&
+        pwm_config_get_remote_usb() == 0u) {
+        const uint32_t now = now_wd;
         uint32_t conn_timeout_ms = ROTOR_CONN_LOST_TIMEOUT_MS;
         if (s_pending == Pending::SetPosDg) {
             conn_timeout_ms = ROTOR_CONN_LOST_TIMEOUT_SETPOSDG_MS;
@@ -2750,6 +5191,14 @@ void rotor_rs485_loop(void)
             conn_timeout = true;
         }
         if (conn_timeout) {
+            /* Fahrt lief gerade (eigenes Polling oder mitgehörte Fremd-Fahrt): nach Wiederkehr
+             * automatisch fortsetzen, statt bis zur nächsten Nutzeraktion im Idle-Polling zu bleiben. */
+            if (s_poll_pos) {
+                s_resume_poll_pos_after_conn_loss = true;
+            }
+            if (s_remote_setpos_motion) {
+                s_resume_remote_setpos_after_conn_loss = true;
+            }
             clear_pending();
             s_err10_recovery_getref_pending = false;
             rotor_error_app_set_error_code(10);
@@ -2761,6 +5210,14 @@ void rotor_rs485_loop(void)
 
     on_ack_timeout();
 
+    if (s_setref_queued && s_pending == Pending::None) {
+        if (s_slave_referenced && !s_poll_ref) {
+            s_setref_queued = false;
+        } else {
+            rotor_rs485_send_setref_homing();
+        }
+    }
+
     /* Vor pending-Return: wartet auf freien Bus (z. B. GETANGLE1…3 nach Boot) — sonst kein erneuter SETPOSDG-Versuch. */
     try_hw_snap_retarget();
 
@@ -2769,44 +5226,67 @@ void rotor_rs485_loop(void)
     try_flush_setposcc();
 
     if (rotor_rs485_is_foreign_pc_listen_mode() && s_pending != Pending::None) {
-        /* Proxy aktiv: lokale Hintergrund-Requests nicht weiter blockieren lassen. */
+        /* Proxy aktiv: Wetter/Ref/Pos-Polling nicht stauen — Boot-Lesevorgänge ausnehmen.
+         * Solange Status-Boot / Startup offen: GETREF/GETPOSDG/GETERR nicht verwerfen
+         * (sonst „Initialisiere“ + gesperrte Display-Bedienung bei WEB/USB). */
+        const bool keep_status_boot =
+            s_status_boot_pending || s_el_status_boot_pending || !s_boot_done || !s_startup_err_known;
         switch (s_pending) {
         case Pending::GetAnemo:
         case Pending::GetTempA:
         case Pending::GetWindDir:
         case Pending::GetTempM:
+            clear_pending();
+            break;
         case Pending::GetErr:
-        case Pending::GetAntOff1:
-        case Pending::GetAntOff2:
-        case Pending::GetAntOff3:
-        case Pending::GetAngle1:
-        case Pending::GetAngle2:
-        case Pending::GetAngle3:
         case Pending::GetRef:
         case Pending::GetPosDg:
-            clear_pending();
+        case Pending::Test:
+            if (!keep_status_boot) {
+                clear_pending();
+            }
             break;
         default:
             break;
         }
     }
 
+    adopt_live_slave_as_boot_complete();
+
+    if (s_pending != Pending::None) {
+        return;
+    }
+
+    /* Achsenwechsel hat Vorrang vor Boot-/Wetter-Schritten: Referenz der neuen Achse klären. */
+    try_axis_switch_getref();
     if (s_pending != Pending::None) {
         return;
     }
 
     if (rotor_rs485_is_foreign_pc_listen_mode()) {
-        /* Eigenes TEST-BOOT laeuft nicht (return vor try_boot_test). Sobald der Slave am Bus
-         * antwortet (Fremd-Master pollt), ist der Link real — Startup-GETERR-Pfad ueberspringen,
-         * sonst bleiben Meldetext „Initialisiere“ und homing_led rot trotz gruenem Ring (Ref aus ACK). */
-        if (!s_startup_err_known) {
-            if (s_boot_test_done) {
-                s_startup_err_known = true;
-            } else if (s_have_slave_rx_ever) {
-                s_boot_test_done = true;
-                s_startup_err_known = true;
-            }
+        /* Eigenes TEST-BOOT laeuft nicht (return vor try_boot_test). */
+        try_aselect_boot_step();
+        if (s_pending != Pending::None) {
+            return;
         }
+        try_antenna_boot_first_get();
+        if (s_pending != Pending::None) {
+            return;
+        }
+        try_angle_boot_step();
+        if (s_pending != Pending::None) {
+            return;
+        }
+        try_enc_boot_step();
+        if (s_pending != Pending::None) {
+            return;
+        }
+        try_name_boot_step();
+        if (s_pending != Pending::None) {
+            return;
+        }
+        try_status_boot_step();
+        try_el_status_boot_step();
         return;
     }
 
@@ -2816,9 +5296,9 @@ void rotor_rs485_loop(void)
         return;
     }
 
-    /* Fehler 10: periodisch GETREF (Intervall ROTOR_CONN_RECOVERY_GETREF_MS via pending_timed_out), bis der
-     * Slave wieder antwortet; Parser hebt Fehler 10 bei erster gültiger Slave-Zeile auf. */
-    if (rotor_error_app_get_error_code() == 10) {
+    /* Fehler 10 (nur lokal/Watchdog): periodisch GETREF, bis der Slave wieder antwortet.
+     * Rotor-gemeldetes ERR:10 ist fault_locked und kommt hier nicht an. */
+    if (rotor_error_app_get_error_code() == 10 && !rotor_error_app_is_rotor_reported()) {
         if (s_pending == Pending::None) {
             s_err10_recovery_getref_pending = true;
             send_request("GETREF", "0", Pending::GetRef);
@@ -2850,19 +5330,79 @@ void rotor_rs485_loop(void)
         return;
     }
 
+    try_aselect_boot_step();
+
+    if (s_pending != Pending::None) {
+        return;
+    }
+
     try_antenna_boot_first_get();
 
     if (s_pending != Pending::None) {
         return;
     }
 
-    if (s_poll_pos) {
+    try_angle_boot_step();
+
+    if (s_pending != Pending::None) {
+        return;
+    }
+
+    try_enc_boot_step();
+
+    if (s_pending != Pending::None) {
+        return;
+    }
+
+    try_name_boot_step();
+
+    if (s_pending != Pending::None) {
+        return;
+    }
+
+    try_status_boot_step();
+
+    if (s_pending != Pending::None) {
+        return;
+    }
+
+    try_el_status_boot_step();
+
+    if (s_pending != Pending::None) {
+        return;
+    }
+
+    if (!s_el_status_boot_pending) {
+        try_endstc_step();
+        if (s_pending != Pending::None) {
+            return;
+        }
+    }
+
+    if (s_poll_pos || s_ka_active) {
         if (rotor_rs485_is_foreign_pc_listen_mode()) {
             /* Fremd-PC pollt GETPOSDG: keine eigene Zusatzlast senden. */
             return;
         }
-        if ((int32_t)(millis() - s_next_pos_poll_ms) >= 0) {
-            send_request("GETPOSDG", "0", Pending::GetPosDg);
+        if (s_pending != Pending::None) {
+            return;
+        }
+        bool poll_ka = false;
+        if (s_ka_active && s_poll_pos) {
+            poll_ka = s_pos_poll_prefer_ka;
+            s_pos_poll_prefer_ka = !s_pos_poll_prefer_ka;
+        } else if (s_ka_active) {
+            poll_ka = true;
+        }
+        if (poll_ka) {
+            if ((int32_t)(millis() - s_ka_next_poll_ms) >= 0) {
+                send_getposdg_to(s_ka_slave_id);
+                s_ka_next_poll_ms = millis() + ROTOR_POLL_GAP_MS;
+            }
+        } else if (s_poll_pos) {
+            if ((int32_t)(millis() - s_next_pos_poll_ms) >= 0) {
+                send_getposdg_to(s_slave_id);
+            }
         }
         return;
     }

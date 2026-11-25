@@ -1,6 +1,6 @@
 /**
- * config.json auf FFat (data/ → uploadfs): PWM, RS485-IDs, Antennen-Bezeichner, letzte Antenne.
- * Antennenversätze kommen zur Laufzeit vom Rotor (GETANTOFFn), nicht aus der Datei.
+ * config.json auf FFat (data/ → uploadfs): PWM, RS485-IDs, letzte Antenne.
+ * Antennenversätze und -namen kommen zur Laufzeit vom Rotor (GETANTOFFn / GETANTNAMEn), nicht aus der Datei.
  * pwm_fast: 1 = Werkseinstellung/UI „Fast“, 0 = „Slow“ (welches PWM-Limit nach Boot/Taste aktiv ist).
  */
 
@@ -19,16 +19,21 @@ static uint8_t s_fast = 100;
 static uint8_t s_pwm_ui_fast = 1;
 static uint8_t s_master_id = 2;
 static uint8_t s_rotor_id = 20;
+static uint8_t s_rotor_el_id = 21;
 /** GETCONFRQ/SETCONFRQ — Touch-Pieps Frequenz (Hz) */
 static uint16_t s_touch_beep_freq_hz = 1100;
 /** GETLSL/SETLSL — Touch-Pieps Lautstärke (0…50, wie Signals::tone) */
 static uint8_t s_touch_beep_vol = 14;
 /** GETCONANO/SETCONANO — Wetter-Tab (1) / aus (0); Standard 0 = kein Wetter vorgegeben */
 static uint8_t s_anemometer = 0;
+/** GETCONREMOTE/SETCONREMOTE — Controller Remote USB (1) / normaler RS485 (0) */
+static uint8_t s_remote_usb = 0;
+/** GETLINKMODE/SETLINKMODE — 0=RS485, 1=PC-USB, 2=WEB */
+static uint8_t s_link_mode = 0;
 /** GETCONDELTA/SETCONDELTA — Zehntel pro Encoder-Raste: 1 = 0,1° oder 10 = 1°; Standard 10 */
 static uint8_t s_encoder_delta_tenths = 10;
 /** GETCONCHA/SETCONCHA — Antennenwechsel: 1 = taget behalten, 0 = taget = Ist-Anzeige */
-static uint8_t s_concha = 1;
+static uint8_t s_concha = 0;
 /** GETCONLEDP/SETCONLEDP — NeoPixel-Ring global 0…100 % */
 static uint8_t s_led_ring_brightness_pct = 100;
 
@@ -36,14 +41,24 @@ static char s_ant_label[3][48];
 static uint8_t s_last_antenna = 1;
 static float s_antoff_deg[3] = { 0.0f, 0.0f, 0.0f };
 static float s_opening_deg[3] = { 0.0f, 0.0f, 0.0f };
+static uint8_t s_antdp[3] = { 0, 0, 0 };
+/** GETENCTYPE: 1 = Axis, 2 = Ring, 3 = erweiterter Ring (z. B. 420°) — nur vom Rotor, nicht config.json */
+static uint8_t s_enc_type = 1;
+/** GETROTORTYPE (EL-Slave): 1/2/3 — Typ 2 = EL 0…90°, sonst 0…180° */
+static uint8_t s_rotor_type = 3;
+/** GETMAXDG in Grad (nach Umrechnung aus 0,01°-Einheiten falls nötig) */
+static float s_axis_max_deg = 360.0f;
 
 static int parse_int_after_key(const char *json, const char *key)
 {
-    const char *p = strstr(json, key);
+    /* Exakt "key": … — kein Teilstring-Match (z. B. "lsl" in anderen Feldern). */
+    char pat[48];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
     if (!p) {
         return -1;
     }
-    p = strchr(p, ':');
+    p = strchr(p + 1, ':');
     if (!p) {
         return -1;
     }
@@ -51,58 +66,10 @@ static int parse_int_after_key(const char *json, const char *key)
     while (*p && *p != '-' && (*p < '0' || *p > '9')) {
         ++p;
     }
+    if (*p == '\0') {
+        return -1;
+    }
     return atoi(p);
-}
-
-/** "key": "value" — value ohne escapte Anführungszeichen in value */
-static bool parse_string_quoted(const char *json, const char *key, char *out, size_t out_sz)
-{
-    char pat[48];
-    snprintf(pat, sizeof(pat), "\"%s\"", key);
-    const char *p = strstr(json, pat);
-    if (!p) {
-        return false;
-    }
-    p = strchr(p + 1, ':');
-    if (!p) {
-        return false;
-    }
-    ++p;
-    while (*p && (*p == ' ' || *p == '\t')) {
-        ++p;
-    }
-    if (*p != '"') {
-        return false;
-    }
-    ++p;
-    if (*p == '"') {
-        out[0] = '\0';
-        return true;
-    }
-    size_t n = 0;
-    while (*p && *p != '"' && n + 1 < out_sz) {
-        out[n++] = *p++;
-    }
-    out[n] = '\0';
-    return true;
-}
-
-static void escape_json_string(const char *in, char *out, size_t out_sz)
-{
-    size_t o = 0;
-    if (!in || !out || out_sz < 4) {
-        return;
-    }
-    while (*in && o + 2 < out_sz) {
-        if (*in == '"' || *in == '\\') {
-            if (o + 3 >= out_sz) {
-                break;
-            }
-            out[o++] = '\\';
-        }
-        out[o++] = *in++;
-    }
-    out[o] = '\0';
 }
 
 void pwm_config_load_defaults(void)
@@ -118,14 +85,62 @@ void pwm_config_load_defaults(void)
     s_ant_label[1][sizeof(s_ant_label[1]) - 1] = '\0';
     s_ant_label[2][sizeof(s_ant_label[2]) - 1] = '\0';
     s_antoff_deg[0] = s_antoff_deg[1] = s_antoff_deg[2] = 0.0f;
+    s_opening_deg[0] = s_opening_deg[1] = s_opening_deg[2] = 0.0f;
+    s_antdp[0] = s_antdp[1] = s_antdp[2] = 0;
+    s_enc_type = 1;
+    s_rotor_type = 3;
+    s_axis_max_deg = 360.0f;
     s_master_id = 2;
     s_rotor_id = 20;
+    s_rotor_el_id = 21;
     s_touch_beep_freq_hz = 1100;
     s_touch_beep_vol = 14;
     s_anemometer = 0;
+    s_remote_usb = 0;
+    s_link_mode = 0;
     s_encoder_delta_tenths = 10;
-    s_concha = 1;
+    s_concha = 0;
     s_led_ring_brightness_pct = 100;
+}
+
+static char s_last_written[1536];
+static bool s_last_written_valid = false;
+
+static size_t render_config_json(char *out, size_t sz)
+{
+    if (!out || sz < 4) {
+        return 0;
+    }
+    /* Nur Skalare — Antennennamen kommen vom Rotor (GETANTNAME), nicht aus der Datei.
+     * Früher Labels in JSON → bei langen Namen Truncation → confrq ging verloren. */
+    const int n = snprintf(out, sz,
+             "{\n"
+             "  \"slow_pwm\": %u,\n"
+             "  \"fast_pwm\": %u,\n"
+             "  \"pwm_fast\": %u,\n"
+             "  \"master_id\": %u,\n"
+             "  \"rotor_id\": %u,\n"
+             "  \"rotor_el_id\": %u,\n"
+             "  \"last_antenna\": %u,\n"
+             "  \"confrq\": %u,\n"
+             "  \"lsl\": %u,\n"
+             "  \"anemometer\": %u,\n"
+             "  \"remote_usb\": %u,\n"
+             "  \"link_mode\": %u,\n"
+             "  \"encoder_delta\": %u,\n"
+             "  \"concha\": %u,\n"
+             "  \"conledp\": %u\n"
+             "}\n",
+             (unsigned)s_slow, (unsigned)s_fast, (unsigned)s_pwm_ui_fast, (unsigned)s_master_id,
+             (unsigned)s_rotor_id, (unsigned)s_rotor_el_id,
+             (unsigned)s_last_antenna, (unsigned)s_touch_beep_freq_hz, (unsigned)s_touch_beep_vol,
+             (unsigned)s_anemometer, (unsigned)s_remote_usb, (unsigned)s_link_mode,
+             (unsigned)s_encoder_delta_tenths, (unsigned)s_concha, (unsigned)s_led_ring_brightness_pct);
+    if (n < 0 || (size_t)n >= sz) {
+        out[0] = '\0';
+        return 0;
+    }
+    return (size_t)n;
 }
 
 void pwm_config_load(void)
@@ -136,7 +151,8 @@ void pwm_config_load(void)
         pwm_config_save();
         return;
     }
-    char buf[768];
+    /* Groß genug für Labels + Skalare (render_config_json bis ~1,5 KB). */
+    char buf[1536];
     size_t n = f.readBytes(buf, sizeof(buf) - 1);
     f.close();
     buf[n] = '\0';
@@ -157,26 +173,18 @@ void pwm_config_load(void)
         s_master_id = (uint8_t)mid;
     }
     int rid = parse_int_after_key(buf, "rotor_id");
-    if (rid >= 1 && rid <= 254) {
+    if (rid >= 0 && rid <= 254) {
         s_rotor_id = (uint8_t)rid;
+    }
+    int reid = parse_int_after_key(buf, "rotor_el_id");
+    if (reid >= 0 && reid <= 254) {
+        s_rotor_el_id = (uint8_t)reid;
     }
     int la = parse_int_after_key(buf, "last_antenna");
     if (la >= 1 && la <= 3) {
         s_last_antenna = (uint8_t)la;
     }
-    char tmp[48];
-    if (parse_string_quoted(buf, "antenna_1_label", tmp, sizeof(tmp))) {
-        strncpy(s_ant_label[0], tmp, sizeof(s_ant_label[0]) - 1);
-        s_ant_label[0][sizeof(s_ant_label[0]) - 1] = '\0';
-    }
-    if (parse_string_quoted(buf, "antenna_2_label", tmp, sizeof(tmp))) {
-        strncpy(s_ant_label[1], tmp, sizeof(s_ant_label[1]) - 1);
-        s_ant_label[1][sizeof(s_ant_label[1]) - 1] = '\0';
-    }
-    if (parse_string_quoted(buf, "antenna_3_label", tmp, sizeof(tmp))) {
-        strncpy(s_ant_label[2], tmp, sizeof(s_ant_label[2]) - 1);
-        s_ant_label[2][sizeof(s_ant_label[2]) - 1] = '\0';
-    }
+    /* Antennennamen nicht aus config.json — Quelle ist der Rotor (GETANTNAME1…3 beim Boot). */
     int cf = parse_int_after_key(buf, "confrq");
     if (cf >= 200 && cf <= 4000) {
         s_touch_beep_freq_hz = (uint16_t)cf;
@@ -188,6 +196,19 @@ void pwm_config_load(void)
     int ano = parse_int_after_key(buf, "anemometer");
     if (ano == 0 || ano == 1) {
         s_anemometer = (uint8_t)ano;
+    }
+    int rem = parse_int_after_key(buf, "remote_usb");
+    if (rem == 0 || rem == 1) {
+        s_remote_usb = (uint8_t)rem;
+    }
+    int lm = parse_int_after_key(buf, "link_mode");
+    if (lm >= 0 && lm <= 2) {
+        s_link_mode = (uint8_t)lm;
+        /* PC-USB (1) und WEB (2): Display ist nicht Bus-Master (Remote-USB-Verhalten). */
+        s_remote_usb = (s_link_mode != 0u) ? 1u : 0u;
+    } else if (rem == 0 || rem == 1) {
+        /* Alte Config ohne link_mode: aus remote_usb ableiten */
+        s_link_mode = (s_remote_usb != 0u) ? 1u : 0u;
     }
     int ed = parse_int_after_key(buf, "encoder_delta");
     if (ed == 1 || ed == 10) {
@@ -201,44 +222,38 @@ void pwm_config_load(void)
     if (ledb >= 0 && ledb <= 100) {
         s_led_ring_brightness_pct = (uint8_t)ledb;
     }
+    /* Nach Load: Snapshot; bei abweichendem Datei-Layout (alte Labels-JSON) sofort migrieren. */
+    char rendered[1536];
+    if (render_config_json(rendered, sizeof(rendered)) > 0) {
+        if (strcmp(buf, rendered) != 0) {
+            s_last_written_valid = false;
+            pwm_config_save();
+        } else {
+            strncpy(s_last_written, rendered, sizeof(s_last_written) - 1);
+            s_last_written[sizeof(s_last_written) - 1] = '\0';
+            s_last_written_valid = true;
+        }
+    }
 }
 
 void pwm_config_save(void)
 {
+    char line[1536];
+    if (render_config_json(line, sizeof(line)) == 0) {
+        return;
+    }
+    if (s_last_written_valid && strcmp(line, s_last_written) == 0) {
+        return;
+    }
     File f = FFat.open("/config.json", "w");
     if (!f) {
         return;
     }
-    char e1[96], e2[96], e3[96];
-    escape_json_string(s_ant_label[0], e1, sizeof(e1));
-    escape_json_string(s_ant_label[1], e2, sizeof(e2));
-    escape_json_string(s_ant_label[2], e3, sizeof(e3));
-    char line[896];
-    snprintf(line, sizeof(line),
-             "{\n"
-             "  \"slow_pwm\": %u,\n"
-             "  \"fast_pwm\": %u,\n"
-             "  \"pwm_fast\": %u,\n"
-             "  \"master_id\": %u,\n"
-             "  \"rotor_id\": %u,\n"
-             "  \"antenna_1_label\": \"%s\",\n"
-             "  \"antenna_2_label\": \"%s\",\n"
-             "  \"antenna_3_label\": \"%s\",\n"
-             "  \"last_antenna\": %u,\n"
-             "  \"confrq\": %u,\n"
-             "  \"lsl\": %u,\n"
-             "  \"anemometer\": %u,\n"
-             "  \"encoder_delta\": %u,\n"
-             "  \"concha\": %u,\n"
-             "  \"conledp\": %u\n"
-             "}\n",
-             (unsigned)s_slow, (unsigned)s_fast, (unsigned)s_pwm_ui_fast, (unsigned)s_master_id,
-             (unsigned)s_rotor_id, e1, e2, e3,
-             (unsigned)s_last_antenna, (unsigned)s_touch_beep_freq_hz, (unsigned)s_touch_beep_vol,
-             (unsigned)s_anemometer, (unsigned)s_encoder_delta_tenths, (unsigned)s_concha,
-             (unsigned)s_led_ring_brightness_pct);
     f.print(line);
     f.close();
+    strncpy(s_last_written, line, sizeof(s_last_written) - 1);
+    s_last_written[sizeof(s_last_written) - 1] = '\0';
+    s_last_written_valid = true;
 }
 
 uint8_t pwm_config_get_slow(void)
@@ -273,6 +288,16 @@ uint8_t pwm_config_get_rotor_id(void)
     return s_rotor_id;
 }
 
+uint8_t pwm_config_get_rotor_az_id(void)
+{
+    return s_rotor_id;
+}
+
+uint8_t pwm_config_get_rotor_el_id(void)
+{
+    return s_rotor_el_id;
+}
+
 void pwm_config_set_master_id(uint8_t id)
 {
     if (id >= 1u && id <= 254u) {
@@ -282,8 +307,20 @@ void pwm_config_set_master_id(uint8_t id)
 
 void pwm_config_set_rotor_id(uint8_t id)
 {
-    if (id >= 1u && id <= 254u) {
+    if (id <= 254u) {
         s_rotor_id = id;
+    }
+}
+
+void pwm_config_set_rotor_az_id(uint8_t id)
+{
+    pwm_config_set_rotor_id(id);
+}
+
+void pwm_config_set_rotor_el_id(uint8_t id)
+{
+    if (id <= 254u) {
+        s_rotor_el_id = id;
     }
 }
 
@@ -367,6 +404,80 @@ void pwm_config_set_opening_deg(int idx, float deg)
     s_opening_deg[idx - 1] = deg;
 }
 
+uint8_t pwm_config_get_antdp(int idx)
+{
+    if (idx < 1 || idx > 3) {
+        return 0;
+    }
+    return s_antdp[idx - 1] ? 1u : 0u;
+}
+
+void pwm_config_set_antdp(int idx, uint8_t v_0_or_1)
+{
+    if (idx < 1 || idx > 3) {
+        return;
+    }
+    s_antdp[idx - 1] = (v_0_or_1 != 0) ? 1u : 0u;
+}
+
+uint8_t pwm_config_get_enc_type(void)
+{
+    return s_enc_type;
+}
+
+void pwm_config_set_enc_type(uint8_t type_1_to_3)
+{
+    if (type_1_to_3 >= 1u && type_1_to_3 <= 3u) {
+        s_enc_type = type_1_to_3;
+    }
+}
+
+uint8_t pwm_config_get_rotor_type(void)
+{
+    return s_rotor_type;
+}
+
+void pwm_config_set_rotor_type(uint8_t type_1_to_3)
+{
+    if (type_1_to_3 >= 1u && type_1_to_3 <= 3u) {
+        s_rotor_type = type_1_to_3;
+    }
+}
+
+float pwm_config_get_el_max_deg(void)
+{
+    /* Typ 2 = nur 0…90° Elevation; Typ 1/3 = 0…180°. */
+    return (s_rotor_type == 2u) ? 90.0f : 180.0f;
+}
+
+float pwm_config_get_axis_max_deg(void)
+{
+    return s_axis_max_deg;
+}
+
+void pwm_config_set_axis_max_deg_raw(float raw_from_bus)
+{
+    float deg = raw_from_bus;
+    /* Protokoll speichert amax in 0,01° (z. B. 42000) — manche ACKs liefern bereits Grad. */
+    if (deg > 1000.0f) {
+        deg *= 0.01f;
+    }
+    if (deg < 0.0f) {
+        deg = 0.0f;
+    } else if (deg > 720.0f) {
+        deg = 720.0f;
+    }
+    s_axis_max_deg = deg;
+}
+
+float pwm_config_get_axis_span_deg(void)
+{
+    if (s_axis_max_deg >= 360.0f && s_axis_max_deg <= 720.0f) {
+        return s_axis_max_deg;
+    }
+    return 360.0f;
+}
+
 uint16_t pwm_config_get_touch_beep_freq_hz(void)
 {
     return s_touch_beep_freq_hz;
@@ -401,6 +512,48 @@ void pwm_config_set_anemometer(uint8_t on_0_or_1)
     if (on_0_or_1 <= 1u) {
         s_anemometer = on_0_or_1;
     }
+}
+
+uint8_t pwm_config_get_remote_usb(void)
+{
+    return s_remote_usb;
+}
+
+void pwm_config_set_remote_usb(uint8_t on_0_or_1)
+{
+    if (on_0_or_1 <= 1u) {
+        if (s_remote_usb != on_0_or_1) {
+            /* Nächsten Save erzwingen — sonst bleibt remote_usb=0 in FFat und Soft-10
+             * kommt nach jedem Kaltstart ohne PC-Software. */
+            s_last_written_valid = false;
+        }
+        s_remote_usb = on_0_or_1;
+        if (on_0_or_1 != 0u) {
+            /* WEB (2) bleibt WEB; sonst PC-USB */
+            if (s_link_mode == 0u) {
+                s_link_mode = 1u;
+            }
+        } else {
+            s_link_mode = 0u;
+        }
+    }
+}
+
+uint8_t pwm_config_get_link_mode(void)
+{
+    return s_link_mode;
+}
+
+void pwm_config_set_link_mode(uint8_t mode_0_to_2)
+{
+    if (mode_0_to_2 > 2u) {
+        return;
+    }
+    if (s_link_mode != mode_0_to_2) {
+        s_last_written_valid = false;
+    }
+    s_link_mode = mode_0_to_2;
+    s_remote_usb = (s_link_mode != 0u) ? 1u : 0u;
 }
 
 uint8_t pwm_config_get_encoder_delta_tenths(void)

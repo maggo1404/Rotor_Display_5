@@ -13,6 +13,7 @@
 #include "rotor_app.h"
 #include "rotor_error_app.h"
 #include "rotor_rs485.h"
+#include "serial_bridge.h"
 #include <Signals.h>
 
 #ifndef SIGNALS_RING_MIN_INTERVAL_MS
@@ -24,10 +25,71 @@
 #define SIGNALS_RING_POINT_SIGMA_LED 0.62f
 #endif
 
+#ifndef SIGNALS_RING_MAX_LEDS
+#define SIGNALS_RING_MAX_LEDS 32u
+#endif
+
+/** Voll-Refresh-Intervall: sendet auch ohne Änderung einmal den kompletten Frame (Selbstheilung). */
+#ifndef SIGNALS_RING_HEARTBEAT_MS
+#define SIGNALS_RING_HEARTBEAT_MS 2000u
+#endif
+
 static Signals *s_sig = nullptr;
 static uint8_t s_n = 16;
 static uint32_t s_last_draw_ms = 0;
 static uint32_t s_pause_until_ms = 0;
+
+/* Frame-Puffer: erst komplett aufbauen, dann nur geänderte Pixel + einmal show() —
+ * vermeidet unnötige NeoPixel-RMT-Transfers bei unverändertem Muster. */
+static uint8_t s_cur_r[SIGNALS_RING_MAX_LEDS];
+static uint8_t s_cur_g[SIGNALS_RING_MAX_LEDS];
+static uint8_t s_cur_b[SIGNALS_RING_MAX_LEDS];
+static uint8_t s_cur_br[SIGNALS_RING_MAX_LEDS];
+static uint8_t s_last_r[SIGNALS_RING_MAX_LEDS];
+static uint8_t s_last_g[SIGNALS_RING_MAX_LEDS];
+static uint8_t s_last_b[SIGNALS_RING_MAX_LEDS];
+static uint8_t s_last_br[SIGNALS_RING_MAX_LEDS];
+static bool s_frame_valid = false;
+static uint32_t s_last_full_ms = 0;
+
+static void frame_set(uint8_t j, uint8_t r, uint8_t g, uint8_t b, uint8_t br)
+{
+    if (j >= SIGNALS_RING_MAX_LEDS) {
+        return;
+    }
+    s_cur_r[j] = r;
+    s_cur_g[j] = g;
+    s_cur_b[j] = b;
+    s_cur_br[j] = br;
+}
+
+/** Aufgebauten Frame senden: nur geänderte Pixel; Heartbeat erzwingt kompletten Frame. */
+static void frame_flush(uint32_t now_ms)
+{
+    const bool force = !s_frame_valid ||
+                       (uint32_t)(now_ms - s_last_full_ms) >= SIGNALS_RING_HEARTBEAT_MS;
+    bool any = false;
+    for (uint8_t j = 0; j < s_n && j < SIGNALS_RING_MAX_LEDS; j++) {
+        const bool diff = !s_frame_valid || s_cur_r[j] != s_last_r[j] ||
+                          s_cur_g[j] != s_last_g[j] || s_cur_b[j] != s_last_b[j] ||
+                          s_cur_br[j] != s_last_br[j];
+        if (force || diff) {
+            s_sig->setPixel(j, s_cur_r[j], s_cur_g[j], s_cur_b[j], s_cur_br[j]);
+            s_last_r[j] = s_cur_r[j];
+            s_last_g[j] = s_cur_g[j];
+            s_last_b[j] = s_cur_b[j];
+            s_last_br[j] = s_cur_br[j];
+            any = true;
+        }
+    }
+    if (any) {
+        s_sig->show();
+    }
+    if (force) {
+        s_last_full_ms = now_ms;
+    }
+    s_frame_valid = true;
+}
 
 static float normalize_deg_for_led(float deg)
 {
@@ -41,13 +103,28 @@ static float normalize_deg_for_led(float deg)
     return x;
 }
 
-/** Richtung als kontinuierliche LED-Position 0..n (für weichen Übergang zwischen benachbarten LEDs) */
+/** Richtung als kontinuierliche LED-Position 0..n (für weichen Übergang zwischen benachbarten LEDs).
+ * AZ: voller Kreis 0…360. EL: 0…180 → LED-Sektor 270°…90° (Uhrzeigersinn). */
 static float deg_to_led_position(float deg_ui)
 {
     if (s_n == 0) {
         return 0.0f;
     }
-    const float x = normalize_deg_for_led(deg_ui);
+    float mapped = deg_ui;
+    if (rotor_app_get_axis() == 1u) {
+        float el = deg_ui;
+        if (el < 0.0f) {
+            el = 0.0f;
+        } else if (el > 180.0f) {
+            el = 180.0f;
+        }
+        /* 0°EL → 270° Ring, 180°EL → 90° Ring (CW) */
+        mapped = 270.0f + el;
+        if (mapped >= 360.0f) {
+            mapped -= 360.0f;
+        }
+    }
+    const float x = normalize_deg_for_led(mapped);
     return (x / 360.0f) * (float)s_n;
 }
 
@@ -90,11 +167,12 @@ static void set_pixel_rg(float rw, uint8_t j)
     const uint8_t g = (uint8_t)lroundf(200.0f * gw);
     const uint8_t b = 0;
     const uint8_t br = (uint8_t)lroundf(90.0f + 15.0f * rw);
-    s_sig->setPixel(j, r, g, b, pwm_config_scale_led_ring_brightness(br));
+    frame_set(j, r, g, b, pwm_config_scale_led_ring_brightness(br));
 }
 
-/** Kleiner Öffnungswinkel: Gauß um Richtung — eine Haupt-LED, Nachbarn gedimmt, Drehen bleibt weich */
-static void set_direction_red_on_green(float led_pos)
+/** Kleiner Öffnungswinkel: Gauß um Richtung — eine Haupt-LED, Nachbarn gedimmt, Drehen bleibt weich.
+ * Dipol: zusätzlich gegenüberliegende Keule (LED-Position + n/2 = 180°), je LED das Maximum. */
+static void set_direction_red_on_green(float led_pos, bool dipole)
 {
     const int n = (int)s_n;
     if (n <= 0) {
@@ -104,11 +182,22 @@ static void set_direction_red_on_green(float led_pos)
     if (w < 0.0f) {
         w += (float)n;
     }
+    float w2 = fmodf(w + (float)n * 0.5f, (float)n);
+    if (w2 < 0.0f) {
+        w2 += (float)n;
+    }
     const float sigma = SIGNALS_RING_POINT_SIGMA_LED;
     const float denom = 2.0f * sigma * sigma;
     for (uint8_t j = 0; j < s_n; j++) {
         const float dist = circular_led_dist_abs(w, (int)j, n);
         float rw = expf(-(dist * dist) / denom);
+        if (dipole) {
+            const float dist2 = circular_led_dist_abs(w2, (int)j, n);
+            const float rw2 = expf(-(dist2 * dist2) / denom);
+            if (rw2 > rw) {
+                rw = rw2;
+            }
+        }
         set_pixel_rg(rw, j);
     }
 }
@@ -119,13 +208,14 @@ static void set_direction_red_on_green(float led_pos)
  * Kein „inner = half - feather“ mehr — das schnitt z. B. bei 150° (half=75°) bei 66° ab und ließ nur
  * 3 LED-Mitten (0…45°) hart rot, obwohl 150° ≈ 6,7 LED-Schritte (16 LEDs) sein sollen.
  */
-static void set_direction_sector_red_on_green(float center_deg_ui, float opening_deg)
+static void set_direction_sector_red_on_green(float center_deg_ui, float opening_deg, bool dipole)
 {
     const int n = (int)s_n;
     if (n <= 0) {
         return;
     }
     const float center = normalize_deg_for_led(center_deg_ui);
+    const float center2 = normalize_deg_for_led(center_deg_ui + 180.0f);
     const float half = opening_deg * 0.5f;
     const float half_safe = (half > 1e-4f) ? half : 1e-4f;
     const float deg_per_led = 360.0f / (float)n;
@@ -138,6 +228,15 @@ static void set_direction_sector_red_on_green(float center_deg_ui, float opening
         if (d <= limit_safe) {
             rw = cosf(1.57079633f * (d / limit_safe));
         }
+        if (dipole) {
+            const float d2 = angle_diff_abs_wrap(center2, led_center_deg);
+            if (d2 <= limit_safe) {
+                const float rw2 = cosf(1.57079633f * (d2 / limit_safe));
+                if (rw2 > rw) {
+                    rw = rw2;
+                }
+            }
+        }
         set_pixel_rg(rw, j);
     }
 }
@@ -148,6 +247,8 @@ void signals_ring_app_init(Signals *signals, uint8_t num_leds)
     s_n = num_leds ? num_leds : 16;
     s_last_draw_ms = 0;
     s_pause_until_ms = 0;
+    s_frame_valid = false;
+    s_last_full_ms = 0;
     if (s_sig) {
         s_sig->setAutoShow(false);
     }
@@ -175,11 +276,19 @@ void signals_ring_app_loop(uint32_t now_ms)
     }
     s_last_draw_ms = now_ms;
 
+    if (rotor_error_app_is_waiting_for_pc()) {
+        for (uint8_t i = 0; i < s_n; i++) {
+            frame_set(i, 255, 200, 0, pwm_config_scale_led_ring_brightness(100));
+        }
+        frame_flush(now_ms);
+        return;
+    }
+
     if (rotor_error_app_is_fault_ring_red()) {
         for (uint8_t i = 0; i < s_n; i++) {
-            s_sig->setPixel(i, 255, 0, 0, pwm_config_scale_led_ring_brightness(100));
+            frame_set(i, 255, 0, 0, pwm_config_scale_led_ring_brightness(100));
         }
-        s_sig->show();
+        frame_flush(now_ms);
         return;
     }
 
@@ -194,24 +303,31 @@ void signals_ring_app_loop(uint32_t now_ms)
         for (uint8_t i = 0; i < s_n; i++) {
             const bool on = (i == (uint8_t)phase) || (i == (uint8_t)((phase + 1u) % s_n));
             if (on) {
-                s_sig->setPixel(i, 255, 80, 0, pwm_config_scale_led_ring_brightness(100));
+                frame_set(i, 255, 80, 0, pwm_config_scale_led_ring_brightness(100));
             } else {
-                s_sig->setPixel(i, 20, 5, 0, pwm_config_scale_led_ring_brightness(25));
+                frame_set(i, 20, 5, 0, pwm_config_scale_led_ring_brightness(25));
             }
         }
     } else if (ref) {
-        const uint8_t ant = pwm_config_get_last_antenna();
-        const float opening = pwm_config_get_opening_deg((int)ant);
-        if (opening >= 20.0f) {
-            set_direction_sector_red_on_green(pos_deg, opening);
+        const uint8_t axis = rotor_app_get_axis();
+        if (axis == 1u) {
+            /* EL: kein Antennen-Öffnungswinkel / keine Dipol-Keule — nur Richtungspunkt. */
+            set_direction_red_on_green(dir_led_pos, false);
         } else {
-            set_direction_red_on_green(dir_led_pos);
+            const uint8_t ant = pwm_config_get_last_antenna();
+            const float opening = pwm_config_get_opening_deg((int)ant);
+            const bool dipole = pwm_config_get_antdp((int)ant) != 0;
+            if (opening >= 20.0f) {
+                set_direction_sector_red_on_green(pos_deg, opening, dipole);
+            } else {
+                set_direction_red_on_green(dir_led_pos, dipole);
+            }
         }
     } else {
         for (uint8_t i = 0; i < s_n; i++) {
-            s_sig->setPixel(i, 80, 25, 0, pwm_config_scale_led_ring_brightness(40));
+            frame_set(i, 80, 25, 0, pwm_config_scale_led_ring_brightness(40));
         }
     }
 
-    s_sig->show();
+    frame_flush(now_ms);
 }
