@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en" data-composition-variables='[{"id":"color-ground","type":"color","label":"Ground","default":"#15171A"},{"id":"color-sky","type":"color","label":"Sky","default":"#C9D3D8"},{"id":"color-accent","type":"color","label":"Accent","default":"#2196F3"}]'>
+<head><meta charset="utf-8"><title>Rotor Display</title>
+<script src="assets/gsap.min.js"></script>
+<style>
+:root{--color-ground:#15171A;--color-sky:#C9D3D8;--color-accent:#2196F3}
+*{box-sizing:border-box;margin:0}
+body{background:#15171A}
+#root{position:relative;width:1920px;height:1080px;overflow:hidden;background:var(--color-ground);font-family:Montserrat,sans-serif}
+.layer{position:absolute;left:0;top:0;width:1920px;height:1080px}
+#sky{background:var(--color-sky)}
+svg{position:absolute;overflow:visible}
+.t{position:absolute;white-space:nowrap;line-height:1.1;letter-spacing:-.01em}
+.ink{color:#15171A}.pale{color:#FAFAFA}
+.big{font-weight:700;font-size:92px}
+.mid{font-weight:500;font-size:60px}
+.sm{font-weight:500;font-size:32px;letter-spacing:0}
+#dev{position:absolute;left:-340px;top:-340px;width:680px;height:680px}
+#dev svg{left:0;top:0;width:680px;height:680px}
+.lg{filter:blur(9px)}
+.spill{position:absolute;left:-340px;top:-340px;width:1360px;height:1360px;border-radius:50%;opacity:0}
+#spG{background:radial-gradient(circle,rgba(0,200,0,.42) 20%,rgba(0,200,0,0) 66%)}
+#spO{background:radial-gradient(circle,rgba(255,80,0,.42) 20%,rgba(255,80,0,0) 66%)}
+#face text{font-family:"Open Sans",sans-serif;text-anchor:middle}
+.num{font-size:22px;fill:#D5D8DD}.numk{font-size:22px;font-weight:700;fill:#2196F3}.card{font-size:32px;font-weight:700;fill:#2196F3}
+#ui{position:absolute;left:194.5px;top:194.5px;width:291px;height:291px;border-radius:50%;overflow:hidden;background:#15171A;color:#FAFAFA}
+#pages{position:absolute;left:0;top:0;width:1164px;height:291px}
+.page{position:absolute;top:0;width:291px;height:291px}
+.f{position:absolute;background:#282B30;border-radius:10px;text-align:center;display:flex;align-items:center;justify-content:center;font-size:32px;font-variant-numeric:tabular-nums}
+.l{position:absolute;font-size:24px;line-height:1}
+.u{position:absolute;font-size:26px;line-height:1}
+.btn{position:absolute;height:44px;border-radius:10px;background:#2196F3;color:#000;font-size:24px;display:flex;align-items:center;justify-content:center}
+.btn.on{background:#087321;color:#fff}
+#led{position:absolute;left:133.5px;top:21.5px;width:24px;height:24px;border-radius:50%}
+</style></head>
+<body>
+<div id="root" data-composition-id="main" data-start="0" data-duration="24.3" data-width="1920" data-height="1080" data-fps="30">
+
+<div id="world" class="layer" data-layout-allow-overflow>
+  <div id="sky" class="layer"></div>
+  <svg width="1920" height="1080" viewBox="0 0 1920 1080">
+    <g stroke="#15171A" stroke-linecap="round" fill="none">
+      <line x1="1300" y1="330" x2="1300" y2="600" stroke-width="12"/>
+      <g id="ant"><g id="antaz" stroke-width="7">
+        <line x1="-270" y1="0" x2="290" y2="0" stroke-width="8"/>
+        <line x1="-255" y1="-120" x2="-255" y2="120"/><line x1="-140" y1="-110" x2="-140" y2="110"/><line x1="-30" y1="-100" x2="-30" y2="100"/><line x1="80" y1="-94" x2="80" y2="94"/><line x1="180" y1="-88" x2="180" y2="88"/><line x1="275" y1="-82" x2="275" y2="82"/>
+      </g></g>
+    </g>
+    <rect x="1276" y="340" width="48" height="62" rx="8" fill="#15171A"/>
+    <polygon points="-600,1060 1300,560 2500,876 2500,1700 -600,1700" fill="#15171A"/>
+    <path d="M1300 566 V860" stroke="#3A4047" stroke-width="5" fill="none"/>
+  </svg>
+</div>
+
+<div id="plan" class="layer"><svg width="1920" height="1080">
+  <g transform="translate(1400 560)">
+    <circle r="262" fill="none" stroke="#3A4047" stroke-width="3" stroke-dasharray="13.4 1.6" pathLength="360"/>
+    <path d="M0 -286 l-11 -22 h22 z" fill="#2196F3" id="north"/>
+    <g id="pAz" stroke="#FAFAFA" stroke-width="7" stroke-linecap="round"><line x1="0" y1="190" x2="0" y2="-200"/><line x1="-150.0" y1="180" x2="150.0" y2="180"/><line x1="-138.0" y1="112" x2="138.0" y2="112"/><line x1="-126.0" y1="44" x2="126.0" y2="44"/><line x1="-118.0" y1="-70" x2="118.0" y2="-70"/><line x1="-112.0" y1="-135" x2="112.0" y2="-135"/><line x1="-107.0" y1="-190" x2="107.0" y2="-190"/><circle r="17" fill="#15171A"/></g>
+    <g id="pElW"><line x1="0" y1="0" x2="0" y2="262" stroke="#8A929B" stroke-width="10"/><line x1="-262" y1="0" x2="-20" y2="0" stroke="#3A4047" stroke-width="3" stroke-dasharray="10 10"/>
+      <g id="pEl" stroke="#FAFAFA" stroke-width="7" stroke-linecap="round"><g transform="rotate(-90)"><line x1="0" y1="190" x2="0" y2="-200"/><line x1="-150.0" y1="180" x2="150.0" y2="180"/><line x1="-138.0" y1="112" x2="138.0" y2="112"/><line x1="-126.0" y1="44" x2="126.0" y2="44"/><line x1="-118.0" y1="-70" x2="118.0" y2="-70"/><line x1="-112.0" y1="-135" x2="112.0" y2="-135"/><line x1="-107.0" y1="-190" x2="107.0" y2="-190"/><circle r="17" fill="#15171A"/></g></g></g>
+  </g></svg></div>
+
+<div id="rig" style="position:absolute;left:0;top:0;width:0;height:0" data-layout-allow-overflow>
+  <div id="dev">
+    <div class="spill" id="spG" data-layout-ignore></div><div class="spill" id="spO" data-layout-ignore></div>
+    <svg viewBox="-340 -340 680 680">
+      <circle r="338" fill="#0A0B0C" stroke="#33383E" stroke-width="3"/>
+      <g transform="translate(0.00 -303.00)"><circle class="lg" id="lg0" r="34"/><circle id="led0" r="11"/></g><g transform="translate(115.95 -279.94)"><circle class="lg" id="lg1" r="34"/><circle id="led1" r="11"/></g><g transform="translate(214.25 -214.25)"><circle class="lg" id="lg2" r="34"/><circle id="led2" r="11"/></g><g transform="translate(279.94 -115.95)"><circle class="lg" id="lg3" r="34"/><circle id="led3" r="11"/></g><g transform="translate(303.00 0.00)"><circle class="lg" id="lg4" r="34"/><circle id="led4" r="11"/></g><g transform="translate(279.94 115.95)"><circle class="lg" id="lg5" r="34"/><circle id="led5" r="11"/></g><g transform="translate(214.25 214.25)"><circle class="lg" id="lg6" r="34"/><circle id="led6" r="11"/></g><g transform="translate(115.95 279.94)"><circle class="lg" id="lg7" r="34"/><circle id="led7" r="11"/></g><g transform="translate(0.00 303.00)"><circle class="lg" id="lg8" r="34"/><circle id="led8" r="11"/></g><g transform="translate(-115.95 279.94)"><circle class="lg" id="lg9" r="34"/><circle id="led9" r="11"/></g><g transform="translate(-214.25 214.25)"><circle class="lg" id="lg10" r="34"/><circle id="led10" r="11"/></g><g transform="translate(-279.94 115.95)"><circle class="lg" id="lg11" r="34"/><circle id="led11" r="11"/></g><g transform="translate(-303.00 0.00)"><circle class="lg" id="lg12" r="34"/><circle id="led12" r="11"/></g><g transform="translate(-279.94 -115.95)"><circle class="lg" id="lg13" r="34"/><circle id="led13" r="11"/></g><g transform="translate(-214.25 -214.25)"><circle class="lg" id="lg14" r="34"/><circle id="led14" r="11"/></g><g transform="translate(-115.95 -279.94)"><circle class="lg" id="lg15" r="34"/><circle id="led15" r="11"/></g>
+      <g id="knob"><circle r="273" fill="#2A2E33"/><g stroke="#4C545C" stroke-width="4"><line x1="0.00" y1="-252.00" x2="0.00" y2="-271.00"/><line x1="21.96" y1="-251.04" x2="23.62" y2="-269.97"/><line x1="43.76" y1="-248.17" x2="47.06" y2="-266.88"/><line x1="65.22" y1="-243.41" x2="70.14" y2="-261.77"/><line x1="86.19" y1="-236.80" x2="92.69" y2="-254.66"/><line x1="106.50" y1="-228.39" x2="114.53" y2="-245.61"/><line x1="126.00" y1="-218.24" x2="135.50" y2="-234.69"/><line x1="144.54" y1="-206.43" x2="155.44" y2="-221.99"/><line x1="161.98" y1="-193.04" x2="174.20" y2="-207.60"/><line x1="178.19" y1="-178.19" x2="191.63" y2="-191.63"/><line x1="193.04" y1="-161.98" x2="207.60" y2="-174.20"/><line x1="206.43" y1="-144.54" x2="221.99" y2="-155.44"/><line x1="218.24" y1="-126.00" x2="234.69" y2="-135.50"/><line x1="228.39" y1="-106.50" x2="245.61" y2="-114.53"/><line x1="236.80" y1="-86.19" x2="254.66" y2="-92.69"/><line x1="243.41" y1="-65.22" x2="261.77" y2="-70.14"/><line x1="248.17" y1="-43.76" x2="266.88" y2="-47.06"/><line x1="251.04" y1="-21.96" x2="269.97" y2="-23.62"/><line x1="252.00" y1="0.00" x2="271.00" y2="0.00"/><line x1="251.04" y1="21.96" x2="269.97" y2="23.62"/><line x1="248.17" y1="43.76" x2="266.88" y2="47.06"/><line x1="243.41" y1="65.22" x2="261.77" y2="70.14"/><line x1="236.80" y1="86.19" x2="254.66" y2="92.69"/><line x1="228.39" y1="106.50" x2="245.61" y2="114.53"/><line x1="218.24" y1="126.00" x2="234.69" y2="135.50"/><line x1="206.43" y1="144.54" x2="221.99" y2="155.44"/><line x1="193.04" y1="161.98" x2="207.60" y2="174.20"/><line x1="178.19" y1="178.19" x2="191.63" y2="191.63"/><line x1="161.98" y1="193.04" x2="174.20" y2="207.60"/><line x1="144.54" y1="206.43" x2="155.44" y2="221.99"/><line x1="126.00" y1="218.24" x2="135.50" y2="234.69"/><line x1="106.50" y1="228.39" x2="114.53" y2="245.61"/><line x1="86.19" y1="236.80" x2="92.69" y2="254.66"/><line x1="65.22" y1="243.41" x2="70.14" y2="261.77"/><line x1="43.76" y1="248.17" x2="47.06" y2="266.88"/><line x1="21.96" y1="251.04" x2="23.62" y2="269.97"/><line x1="0.00" y1="252.00" x2="0.00" y2="271.00"/><line x1="-21.96" y1="251.04" x2="-23.62" y2="269.97"/><line x1="-43.76" y1="248.17" x2="-47.06" y2="266.88"/><line x1="-65.22" y1="243.41" x2="-70.14" y2="261.77"/><line x1="-86.19" y1="236.80" x2="-92.69" y2="254.66"/><line x1="-106.50" y1="228.39" x2="-114.53" y2="245.61"/><line x1="-126.00" y1="218.24" x2="-135.50" y2="234.69"/><line x1="-144.54" y1="206.43" x2="-155.44" y2="221.99"/><line x1="-161.98" y1="193.04" x2="-174.20" y2="207.60"/><line x1="-178.19" y1="178.19" x2="-191.63" y2="191.63"/><line x1="-193.04" y1="161.98" x2="-207.60" y2="174.20"/><line x1="-206.43" y1="144.54" x2="-221.99" y2="155.44"/><line x1="-218.24" y1="126.00" x2="-234.69" y2="135.50"/><line x1="-228.39" y1="106.50" x2="-245.61" y2="114.53"/><line x1="-236.80" y1="86.19" x2="-254.66" y2="92.69"/><line x1="-243.41" y1="65.22" x2="-261.77" y2="70.14"/><line x1="-248.17" y1="43.76" x2="-266.88" y2="47.06"/><line x1="-251.04" y1="21.96" x2="-269.97" y2="23.62"/><line x1="-252.00" y1="0.00" x2="-271.00" y2="0.00"/><line x1="-251.04" y1="-21.96" x2="-269.97" y2="-23.62"/><line x1="-248.17" y1="-43.76" x2="-266.88" y2="-47.06"/><line x1="-243.41" y1="-65.22" x2="-261.77" y2="-70.14"/><line x1="-236.80" y1="-86.19" x2="-254.66" y2="-92.69"/><line x1="-228.39" y1="-106.50" x2="-245.61" y2="-114.53"/><line x1="-218.24" y1="-126.00" x2="-234.69" y2="-135.50"/><line x1="-206.43" y1="-144.54" x2="-221.99" y2="-155.44"/><line x1="-193.04" y1="-161.98" x2="-207.60" y2="-174.20"/><line x1="-178.19" y1="-178.19" x2="-191.63" y2="-191.63"/><line x1="-161.98" y1="-193.04" x2="-174.20" y2="-207.60"/><line x1="-144.54" y1="-206.43" x2="-155.44" y2="-221.99"/><line x1="-126.00" y1="-218.24" x2="-135.50" y2="-234.69"/><line x1="-106.50" y1="-228.39" x2="-114.53" y2="-245.61"/><line x1="-86.19" y1="-236.80" x2="-92.69" y2="-254.66"/><line x1="-65.22" y1="-243.41" x2="-70.14" y2="-261.77"/><line x1="-43.76" y1="-248.17" x2="-47.06" y2="-266.88"/><line x1="-21.96" y1="-251.04" x2="-23.62" y2="-269.97"/></g></g>
+      <circle r="246" fill="#0A0B0C"/><circle r="236" fill="#000"/>
+      <g id="face">
+        <g fill="none" stroke="#E8EAED" stroke-width="5" id="faz">
+          <circle r="230" pathLength="360" stroke-dasharray="13.6 1.4" stroke-dashoffset="-.7"/>
+          <circle r="196" pathLength="360" stroke-dasharray="13.6 1.4" stroke-dashoffset="-.7" stroke-width="4"/>
+          <g stroke="none"><text x="0.0" y="-159.0" class="card">N</text><text x="44.0" y="-156.2" class="num">15</text><text x="85.0" y="-139.2" class="num">30</text><text x="120.2" y="-112.2" class="num">45</text><text x="147.2" y="-77.0" class="num">60</text><text x="164.2" y="-36.0" class="num">75</text><text x="170.0" y="11.0" class="card">O</text><text x="164.2" y="52.0" class="num">105</text><text x="147.2" y="93.0" class="num">120</text><text x="120.2" y="128.2" class="num">135</text><text x="85.0" y="155.2" class="num">150</text><text x="44.0" y="172.2" class="num">165</text><text x="0.0" y="181.0" class="card">S</text><text x="-44.0" y="172.2" class="num">195</text><text x="-85.0" y="155.2" class="num">210</text><text x="-120.2" y="128.2" class="num">225</text><text x="-147.2" y="93.0" class="num">240</text><text x="-164.2" y="52.0" class="num">255</text><text x="-170.0" y="11.0" class="card">W</text><text x="-164.2" y="-36.0" class="num">285</text><text x="-147.2" y="-77.0" class="num">300</text><text x="-120.2" y="-112.2" class="num">315</text><text x="-85.0" y="-139.2" class="num">330</text><text x="-44.0" y="-156.2" class="num">345</text></g></g>
+        <g fill="none" stroke="#E8EAED" stroke-width="5" id="fel">
+          <circle r="230" pathLength="360" stroke-dasharray="13.6 1.4" stroke-dashoffset="179.3" style="clip-path:inset(0 0 215px 0)" id="elo"/>
+          <path d="M-196 0 A196 196 0 0 1 196 0" pathLength="180" stroke-dasharray="13.6 1.4" stroke-width="4"/>
+          <path d="M-230 0 V16 A230 230 0 0 0 230 16 V0"/><path d="M-230 16 H-148 M148 16 H230"/>
+          <path id="elp" d="M-207 0 A207 207 0 0 0 207 0" stroke="none"/>
+          <g stroke="none"><text x="-171.0" y="8.0" class="numk">0</text><text x="-165.2" y="-36.3" class="num">15</text><text x="-148.1" y="-77.5" class="num">30</text><text x="-120.9" y="-112.9" class="num">45</text><text x="-85.5" y="-140.1" class="num">60</text><text x="-44.3" y="-157.2" class="num">75</text><text x="-0.0" y="-163.0" class="numk">90</text><text x="44.3" y="-157.2" class="num">105</text><text x="85.5" y="-140.1" class="num">120</text><text x="120.9" y="-112.9" class="num">135</text><text x="148.1" y="-77.5" class="num">150</text><text x="165.2" y="-36.3" class="num">165</text><text x="171.0" y="8.0" class="numk">180</text><text style="font-size:44px;fill:#FAFAFA"><textPath href="#elp" startOffset="50%">Elevation</textPath></text></g></g>
+        <path id="arc" fill="none" stroke="#2196F3" stroke-width="13" stroke-linecap="round"/>
+        <circle id="mk" r="15" fill="#F00"/><circle id="kn" r="11" fill="#F00"/>
+      </g>
+    </svg>
+    <div id="ui"><div id="pages">
+      <div class="page" style="left:0">
+        <div id="led"></div>
+        <div class="l" style="left:35.5px;top:68px">T</div><div class="f" id="T" style="left:65px;top:63px;width:151px;height:43px">0,0</div><div class="u" style="left:219px;top:63px">°</div>
+        <div class="f" id="msg" style="left:9.5px;top:128px;width:272px;height:35px;font-size:24px">Initialisiere</div>
+        <div class="l" style="left:35.5px;top:206px">A</div><div class="f" id="A" style="left:70px;top:195px;width:150px;height:43px">0,0</div><div class="u" style="left:224px;top:195px">°</div>
+      </div>
+      <div class="page" style="left:291px"><div class="btn "  style="left:66.5px;top:42.5px;width:158px">RS485</div><div class="btn on"  style="left:66.5px;top:123.5px;width:158px">Fast</div><div class="btn "  style="left:66.5px;top:202.5px;width:158px">Homing</div></div>
+      <div class="page" style="left:582px"><div class="btn on" id="ant1" style="left:53.0px;top:46.5px;width:185px">KW Beam</div><div class="btn " id="ant2" style="left:53.0px;top:124.5px;width:185px">2m / 70cm</div><div class="btn "  style="left:53.0px;top:198.5px;width:185px">23 cm</div></div>
+      <div class="page" style="left:873px">
+        <div class="f" id="wind" style="left:59px;top:38px;width:97px;height:37px;font-size:26px">31,8</div><div class="u" style="left:167px;top:43px">kmh</div>
+        <img id="warrow" src="assets/img/windPfeil.png" style="position:absolute;left:95.5px;top:95.5px;width:100px;height:100px" alt="">
+        <div class="f" style="left:87px;top:231px;width:69px;height:37px;font-size:26px">25,1</div><div class="u" style="left:167px;top:236px">°C</div>
+      </div>
+    </div></div>
+  </div>
+</div>
+
+<div id="c1" class="clip" data-start="0" data-duration="3.7" data-track-index="1"><div id="t1" class="t big ink" style="left:150px;top:270px">It's up there.</div></div>
+<div id="c2" class="clip" data-start="1.85" data-duration="1.85" data-track-index="0"><div id="t2" class="t big pale" style="right:720px;top:852px">You're down here.</div></div>
+<div id="c3" class="clip" data-start="9.3" data-duration="5.0" data-track-index="1"><div id="t3" class="t mid pale" style="left:1180px;top:120px">0.1° per click</div></div>
+<div id="c4" class="clip" data-start="14.5" data-duration="3.0" data-track-index="1"><div id="t4" class="t mid pale" style="left:1180px;top:120px">Hold: AZ → EL</div></div>
+<div id="c5" class="clip" data-start="20.9" data-duration="3.4" data-track-index="1"><div id="t5" class="t big ink" style="left:150px;top:270px">Rotor Display</div></div>
+<div id="c6" class="clip" data-start="21.1" data-duration="3.2" data-track-index="0"><div id="t6" class="t sm ink" style="left:156px;top:388px">Firmware 1.5.9 · ESP32-S3 · Apache-2.0</div></div>
+<div id="c7" class="clip" data-start="22.0" data-duration="2.3" data-track-index="9"><div id="t7" class="t big pale" style="right:720px;top:852px">Point taken.</div></div>
+<audio id="sfx1" class="clip" data-start="3.30" data-duration="0.6" data-track-index="4" data-volume="0.3" src="assets/sfx/card-slide-1.ogg"></audio>
+<audio id="sfx2" class="clip" data-start="6.80" data-duration="0.18" data-track-index="4" data-volume="0.42" src="assets/sfx/impactSoft_medium_001.ogg"></audio>
+<audio id="sfx3" class="clip" data-start="9.00" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_002.ogg"></audio>
+<audio id="sfx4" class="clip" data-start="9.30" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_003.ogg"></audio>
+<audio id="sfx5" class="clip" data-start="9.60" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_005.ogg"></audio>
+<audio id="sfx6" class="clip" data-start="9.90" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_002.ogg"></audio>
+<audio id="sfx7" class="clip" data-start="10.12" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_003.ogg"></audio>
+<audio id="sfx8" class="clip" data-start="10.23" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_005.ogg"></audio>
+<audio id="sfx9" class="clip" data-start="10.34" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_002.ogg"></audio>
+<audio id="sfx10" class="clip" data-start="10.45" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_003.ogg"></audio>
+<audio id="sfx11" class="clip" data-start="10.56" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_005.ogg"></audio>
+<audio id="sfx12" class="clip" data-start="10.67" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_002.ogg"></audio>
+<audio id="sfx13" class="clip" data-start="10.78" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_003.ogg"></audio>
+<audio id="sfx14" class="clip" data-start="10.89" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_005.ogg"></audio>
+<audio id="sfx15" class="clip" data-start="11.00" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_002.ogg"></audio>
+<audio id="sfx16" class="clip" data-start="13.58" data-duration="0.12" data-track-index="4" data-volume="0.38" src="assets/sfx/impactSoft_medium_000.ogg"></audio>
+<audio id="sfx17" class="clip" data-start="14.83" data-duration="0.6" data-track-index="4" data-volume="0.22" src="assets/sfx/switch_007.ogg"></audio>
+<audio id="sfx18" class="clip" data-start="15.28" data-duration="0.18" data-track-index="5" data-volume="0.4" src="assets/sfx/impactSoft_medium_001.ogg"></audio>
+<audio id="sfx19" class="clip" data-start="15.40" data-duration="0.02" data-track-index="6" data-volume="0.22" src="assets/sfx/click_003.ogg"></audio>
+<audio id="sfx20" class="clip" data-start="15.50" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_005.ogg"></audio>
+<audio id="sfx21" class="clip" data-start="15.60" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_002.ogg"></audio>
+<audio id="sfx22" class="clip" data-start="15.70" data-duration="0.02" data-track-index="4" data-volume="0.22" src="assets/sfx/click_003.ogg"></audio>
+<audio id="sfx23" class="clip" data-start="17.45" data-duration="0.6" data-track-index="4" data-volume="0.26" src="assets/sfx/card-slide-1.ogg"></audio>
+<audio id="sfx24" class="clip" data-start="18.56" data-duration="0.05" data-track-index="4" data-volume="0.5" src="assets/sfx/click_005.ogg"></audio>
+<audio id="sfx25" class="clip" data-start="18.98" data-duration="0.6" data-track-index="4" data-volume="0.24" src="assets/sfx/card-slide-1.ogg"></audio>
+<audio id="sfx26" class="clip" data-start="20.19" data-duration="0.54" data-track-index="4" data-volume="0.36" src="assets/sfx/impactSoft_heavy_003.ogg"></audio>
+<audio id="sfx27" class="clip" data-start="22.08" data-duration="1.48" data-track-index="4" data-volume="0.3" src="assets/sfx/impactBell_heavy_000.ogg"></audio>
+<audio id="vo1" class="clip" data-start="0.5" data-duration="3.584" data-track-index="3" data-volume="1" src="assets/vo/v1.wav"></audio>
+<audio id="vo2" class="clip" data-start="4.6" data-duration="3.52" data-track-index="3" data-volume="1" src="assets/vo/v2.wav"></audio>
+<audio id="vo3" class="clip" data-start="8.7" data-duration="5.034" data-track-index="3" data-volume="1" src="assets/vo/v3.wav"></audio>
+<audio id="vo4" class="clip" data-start="14.5" data-duration="2.752" data-track-index="3" data-volume="1" src="assets/vo/v4.wav"></audio>
+<audio id="vo5" class="clip" data-start="17.8" data-duration="1.877" data-track-index="3" data-volume="1" src="assets/vo/v5.wav"></audio>
+<audio id="vo6" class="clip" data-start="20.95" data-duration="1.92" data-track-index="3" data-volume="1" src="assets/vo/v6.wav"></audio>
+<audio id="music" class="clip" data-start="0" data-duration="24.3" data-track-index="2" data-automation="{&quot;version&quot;:1,&quot;lanes&quot;:[{&quot;target&quot;:&quot;volume&quot;,&quot;points&quot;:[{&quot;t&quot;:0,&quot;v&quot;:0.5},{&quot;t&quot;:0.35,&quot;v&quot;:0.5},{&quot;t&quot;:0.6,&quot;v&quot;:0.15},{&quot;t&quot;:13.73,&quot;v&quot;:0.15},{&quot;t&quot;:13.98,&quot;v&quot;:0.34},{&quot;t&quot;:14.25,&quot;v&quot;:0.34},{&quot;t&quot;:14.55,&quot;v&quot;:0.15},{&quot;t&quot;:19.68,&quot;v&quot;:0.15},{&quot;t&quot;:19.93,&quot;v&quot;:0.34},{&quot;t&quot;:20.7,&quot;v&quot;:0.34},{&quot;t&quot;:21.0,&quot;v&quot;:0.15},{&quot;t&quot;:22.87,&quot;v&quot;:0.15},{&quot;t&quot;:23.2,&quot;v&quot;:0.5},{&quot;t&quot;:23.5,&quot;v&quot;:0.5},{&quot;t&quot;:24.25,&quot;v&quot;:0}]}]}" src="assets/music/happy-beats-business-moves-vol-10-by-ende-dot-app.mp3"></audio>
+</div>
+<script>
+(function(){
+const RMS=[0.92, 0.77, 0.76, 0.19, 0.02, 0.65, 0.81, 0.71, 0.46, 0.46, 0.68, 0.32, 0.48, 0.45, 0.57, 0.26, 0.75, 0.66, 0.2, 0.8, 0.71, 0.71, 0.72, 0.65, 0.5, 0.14, 0.03, 0.83, 0.76, 0.65, 0.3, 0.58, 0.74, 0.13, 0.26, 0.68, 0.7, 0.21, 0.83, 0.66, 0.38, 0.83, 0.8, 0.67, 0.57, 0.51, 0.52, 0.09, 0.02, 0.8, 0.77, 0.58, 0.21, 0.61, 0.63, 0.12, 0.42, 0.57, 0.48, 0.09, 0.79, 0.46, 0.46, 0.72, 0.65, 0.88, 0.76, 0.43, 0.3, 0.05, 0.28, 0.93, 0.79, 0.62, 0.1, 0.68, 0.67, 0.39, 0.73, 0.78, 0.64, 0.46, 0.88, 0.61, 0.63, 0.83, 0.48, 0.79, 0.86, 0.8, 0.45, 0.08, 0.59, 0.85, 0.76, 0.57, 0.17, 0.81, 0.66, 0.32, 0.4, 0.68, 0.42, 0.67, 0.78, 0.49, 0.68, 0.76, 0.67, 0.85, 0.81, 0.62, 0.22, 0.04, 0.71, 0.89, 0.74, 0.33, 0.48, 0.77, 0.57, 0.18, 0.46, 0.83, 0.53, 0.82, 0.88, 0.52, 0.81, 0.84, 0.61, 0.89, 0.75, 0.67, 0.14, 0.04, 0.79, 0.88, 0.72, 0.32, 0.63, 0.85, 0.36, 0.36, 0.57, 0.74, 0.16, 0.86, 0.68, 0.42, 0.81, 0.76, 0.84, 0.84, 0.75, 0.32, 0.07, 0.03, 0.89, 0.78, 0.7, 0.22, 0.6, 0.8, 0.16, 0.32, 0.75, 0.82, 0.35, 0.87, 0.8, 0.42, 0.85, 0.82, 1.0, 0.87, 0.75, 0.41, 0.01, 0.2, 0.94, 0.69, 0.53, 0.02, 0.71, 0.9, 0.26, 0.27, 0.63, 0.61, 0.36, 0.84, 0.46, 0.49, 0.78, 0.73, 0.84, 0.8, 0.74, 0.19, 0.0, 0.72, 0.86, 0.79, 0.44, 0.01, 0.77, 0.92, 0.31, 0.11, 0.7, 0.56, 0.62, 0.86, 0.65, 0.53, 0.64, 0.62, 0.86, 0.6, 0.54, 0.2, 0.01, 0.73, 0.89, 0.77, 0.55, 0.28, 0.63, 0.79, 0.3, 0.16, 0.59, 0.28, 0.75, 0.66, 0.27, 0.62, 0.69, 0.7, 0.92, 0.68, 0.23, 0.0, 0.0],$=id=>document.getElementById(id);
+const cl=(x)=>Math.max(0,Math.min(1,x)),io=x=>x<.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2,pr=(t,a,b)=>cl((t-a)/(b-a));
+const de=v=>(Math.floor(v*10+1e-4)/10).toFixed(1).replace('.',',');
+const P=(r,a)=>{a=(a-90)*Math.PI/180;return [r*Math.cos(a),r*Math.sin(a)]};
+function arc(a,b){if(Math.abs(b-a)<.3)return'';if(b<a){const x=a;a=b;b=x}const p=P(213,a),q=P(213,b);return`M${p[0]} ${p[1]}A213 213 0 ${b-a>180?1:0} 1 ${q[0]} ${q[1]}`}
+// azimuth: tenths per click, then the knob accelerates; the rotor waits 670 ms (ENCODER_SEND_IDLE_MS)
+function Taz(t){if(t<9)return 0;if(t<10.12)return .1*(t>=9.9?4:t>=9.6?3:t>=9.3?2:1);const u=pr(t,10.12,11.1);return Math.round((.4+46.9*(1-Math.pow(1-u,1.6)))*10)/10}
+const Aaz=t=>47.3*io(pr(t,11.77,13.6));
+const Tel=t=>Math.round(350*pr(t,15.4,15.75))/10, Ael=t=>35*io(pr(t,16.42,17.12));
+function knobA(t){let k=0;[9,9.3,9.6,9.9].forEach(c=>k+=8*cl((t-c)/.08));const u=pr(t,10.12,11.1);return k+190*(1-Math.pow(1-u,1.6))+70*pr(t,15.4,15.75)}
+const L=[...Array(16).keys()].map(j=>[$('led'+j),$('lg'+j)]);
+function draw(t){
+  const el=t>=15.28&&t<17.47, A=el?Ael(t):Aaz(t), T=el?Tel(t):Taz(t);
+  $('T').textContent=de(T);$('A').textContent=de(A);
+  const boot=t<5.3, home=t>=5.3&&t<6.82, ref=t>=6.82;
+  $('msg').textContent=boot?'Initialisiere':home?'Referenziere':'Betriebsbereit';
+  $('led').style.background=ref?'#43b302':'#f00';
+  $('faz').style.display=el?'none':'';$('fel').style.display=el?'':'none';
+  $('arc').setAttribute('d',ref?(el?arc(0,A-90):arc(0,A)):'');
+  const ang=el?270+A:A, tg=el?270+T:T, k=P(213,ang), m=P(213,tg);
+  $('kn').setAttribute('transform',`translate(${k[0]} ${k[1]})`);$('mk').setAttribute('transform',`translate(${m[0]} ${m[1]})`);
+  $('mk').style.opacity=ref&&Math.abs(T-A)>.05?1:0;
+  const ph=Math.floor(t*1000/70)%16, pos=ang/22.5;
+  L.forEach(([d,g],j)=>{let c=[80,25,0],go=.3;
+    if(home){const on=j===ph||j===(ph+1)%16;c=on?[255,80,0]:[38,14,4];go=on?.8:0}
+    else if(ref){let x=Math.abs(j-pos)%16;if(x>8)x=16-x;const w=Math.exp(-x*x/(2*.55*.55));c=[Math.round(255*w),Math.round(200*(1-w)),0];go=.55+.3*w}
+    const s=`rgb(${c})`;d.setAttribute('fill',s);g.setAttribute('fill',s);g.setAttribute('opacity',go)});
+  const i=Math.min(RMS.length-1,t*10),f=Math.floor(i),e=RMS[f]+((RMS[f+1]??RMS[f])-RMS[f])*(i-f);
+  const lvl=(.62+.38*e);                       // audio-reactive LED spill
+  $('spG').style.opacity=ref?lvl*cl((t-6.82)/.25):0;$('spO').style.opacity=home?lvl*.8:boot?.45:0;
+  $('knob').setAttribute('transform',`rotate(${knobA(t)})`);
+  $('pAz').setAttribute('transform',`rotate(${Aaz(t)})`);$('pEl').setAttribute('transform',`rotate(${Ael(t)})`);
+  const a2=t>=18.55;$('ant1').className='btn'+(a2?'':' on');$('ant2').className='btn'+(a2?' on':'');
+  const w=pr(t,19.0,20.1);$('wind').textContent=de(31.8+1.6*w);
+  $('warrow').style.transform=`rotate(${-38+16*Math.sin(w*3.1)}deg)`;
+  // roof antenna: swings round through the boom's foreshortening, then tips up
+  const s=io(pr(t,21.0,21.9)), tilt=io(pr(t,21.55,22.15));
+  $('ant').setAttribute('transform',`translate(1300 330) rotate(${-28*tilt}) scale(${-Math.cos(Math.PI*s)} 1)`);
+}
+const clk={v:0};let cur=0;Object.defineProperty(clk,'t',{get:()=>cur,set:v=>{cur=v;draw(v)}});
+const tl=gsap.timeline({paused:true});
+tl.fromTo(clk,{t:0},{t:24.3,duration:24.3,ease:'none',immediateRender:true},0);
+// camera: the tiny ring under the roof is the device
+const Z=11.667;
+tl.set('#rig',{x:1300,y:900,scale:.12},0).set('#world',{transformOrigin:'1300px 900px',x:0,y:0,scale:1},0);
+tl.set('#ui,#face',{opacity:0},0).set('#plan',{opacity:0},0).set('#pAz,#north',{opacity:1},0).set('#pElW',{opacity:0},0);
+tl.to('#rig',{x:960,y:540,scale:1.4,duration:.85,ease:'power3.inOut'},3.3);
+tl.to('#world',{x:-340,y:-360,scale:Z,duration:.85,ease:'power3.inOut'},3.3);
+tl.set('#world',{opacity:0},4.2);
+tl.to('#ui,#face',{opacity:1,duration:.3,ease:'power2.out'},4.1);
+// hook lines
+tl.fromTo('#t1',{opacity:0,filter:'blur(8px)'},{opacity:1,filter:'blur(0px)',duration:.2,ease:'power4.out'},.1);
+tl.fromTo('#t2',{opacity:0,filter:'blur(8px)'},{opacity:1,filter:'blur(0px)',duration:.2,ease:'power4.out'},1.9);
+tl.to('#t1,#t2',{opacity:0,filter:'blur(8px)',duration:.2,ease:'power3.in'},3.3);
+// knob scene
+tl.to('#rig',{x:580,scale:1.2,duration:.6,ease:'power3.inOut'},8.25); // beat-grid: 8.22
+tl.to('#plan',{opacity:1,duration:.35,ease:'power2.out'},8.6);
+tl.fromTo('#t3',{clipPath:'inset(0 100% 0 0)'},{clipPath:'inset(0 0% 0 0)',duration:.4,ease:'expo.out'},9.35);
+tl.to('#t3',{opacity:0,filter:'blur(6px)',duration:.18,ease:'power3.in'},14.05);
+// press and hold: 450 ms, then the axis flips — beat-locked: 15.28s
+tl.fromTo('#t4',{opacity:0},{opacity:1,duration:.15,ease:'power4.out'},14.6);
+tl.to('#rig',{scale:1.15,duration:.12,ease:'power3.out'},14.83);
+tl.to('#rig',{scale:1.2,duration:.3,ease:'power4.out'},15.28);
+tl.to('#pAz,#north',{opacity:0,duration:.15},15.28).to('#pElW',{opacity:1,duration:.2},15.34);
+// swipes — beat-locked: 17.47s
+tl.to('#t4',{opacity:0,duration:.15},17.26).to('#plan',{opacity:0,duration:.2},17.26);
+tl.to('#rig',{x:960,scale:1.4,duration:.6,ease:'power3.inOut'},17.22);
+tl.to('#pages',{x:-582,duration:.5,ease:'power4.out'},17.47);
+tl.to('#ant2',{scale:.94,duration:.07},18.5).to('#ant2',{scale:1,duration:.16,ease:'power3.out'},18.58); // beat-locked: 18.55s
+tl.to('#pages',{x:-873,duration:.4,ease:'power4.out'},19.0);
+// pull out — beat-locked: 20.19s
+tl.to('#ui,#face',{opacity:0,duration:.35,ease:'power2.in'},20.19);
+tl.set('#world',{opacity:1},20.19);
+tl.to('#rig',{x:1300,y:900,scale:.12,duration:.85,ease:'power3.inOut'},20.19);
+tl.to('#world',{x:0,y:0,scale:1,duration:.85,ease:'power3.inOut'},20.19);
+tl.fromTo('#t5',{opacity:0,filter:'blur(8px)'},{opacity:1,filter:'blur(0px)',duration:.2,ease:'power4.out'},20.98);
+tl.fromTo('#t6',{opacity:0},{opacity:1,duration:.3},21.25);
+tl.fromTo('#t7',{opacity:0,filter:'blur(8px)'},{opacity:1,filter:'blur(0px)',duration:.18,ease:'power4.out'},22.06);
+window.__timelines=window.__timelines||{};window.__timelines['main']=tl;
+})();
+</script>
+</body></html>

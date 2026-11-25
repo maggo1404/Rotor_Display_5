@@ -11,3 +11,6 @@ compile_commands.json
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# HyperFrames-Arbeitsordner (Cache, Prüfberichte mit lokalen Pfaden)
+Info/video/*/composition/.hyperframes/
